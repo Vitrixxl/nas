@@ -14,7 +14,8 @@ export NAS_SESSION_TTL_HOURS="12"
 # export NAS_PUBLIC_BASE_URL="https://nas.example.com"
 ```
 
-`NAS_LOGIN_PASSWORD` est obligatoire. Le front garde le token de session dans `sessionStorage`.
+`NAS_LOGIN_PASSWORD` est obligatoire. La session est conservee dans un cookie `HttpOnly` limite a `/api`.
+Les liens publics de partage expirent automatiquement apres 1 heure.
 
 ## Lancer en local
 

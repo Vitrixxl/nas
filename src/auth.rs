@@ -7,7 +7,10 @@ use std::{
 
 use axum::{
     extract::{ConnectInfo, Request, State},
-    http::{HeaderMap, header::AUTHORIZATION},
+    http::{
+        HeaderMap,
+        header::{AUTHORIZATION, COOKIE},
+    },
     middleware::Next,
     response::Response,
 };
@@ -21,6 +24,8 @@ use crate::{
     models::SessionRow,
     storage::now_ts,
 };
+
+pub const SESSION_COOKIE_NAME: &str = "nas_session";
 
 #[derive(Clone, Debug)]
 pub struct AuthenticatedSession {
@@ -66,6 +71,19 @@ pub fn hash_token(token: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(token.as_bytes());
     hex::encode(hasher.finalize())
+}
+
+pub fn session_cookie(token: &str, max_age_seconds: i64, secure: bool) -> String {
+    let secure_attr = if secure { "; Secure" } else { "" };
+    format!(
+        "{SESSION_COOKIE_NAME}={token}; Path=/api; Max-Age={}; HttpOnly; SameSite=Strict{secure_attr}",
+        max_age_seconds.max(0)
+    )
+}
+
+pub fn expired_session_cookie(secure: bool) -> String {
+    let secure_attr = if secure { "; Secure" } else { "" };
+    format!("{SESSION_COOKIE_NAME}=; Path=/api; Max-Age=0; HttpOnly; SameSite=Strict{secure_attr}")
 }
 
 pub fn password_matches(expected: &str, received: &str) -> bool {
@@ -140,7 +158,7 @@ pub async fn require_auth(
 }
 
 fn request_token(request: &Request) -> Option<&str> {
-    bearer_token(request.headers()).or_else(|| query_token(request.uri().query()))
+    bearer_token(request.headers()).or_else(|| cookie_token(request.headers()))
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {
@@ -148,10 +166,11 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
     value.strip_prefix("Bearer ")
 }
 
-fn query_token(query: Option<&str>) -> Option<&str> {
-    query?.split('&').find_map(|pair| {
-        let (key, value) = pair.split_once('=')?;
-        matches!(key, "access_token" | "token").then_some(value)
+fn cookie_token(headers: &HeaderMap) -> Option<&str> {
+    let value = headers.get(COOKIE)?.to_str().ok()?;
+    value.split(';').find_map(|pair| {
+        let (key, value) = pair.trim().split_once('=')?;
+        (key == SESSION_COOKIE_NAME && !value.is_empty()).then_some(value)
     })
 }
 
@@ -192,11 +211,30 @@ mod tests {
     }
 
     #[test]
-    fn reads_access_token_from_query_string() {
-        assert_eq!(
-            query_token(Some("access_token=abc-123&other=value")),
-            Some("abc-123")
+    fn reads_session_token_from_cookie() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            COOKIE,
+            HeaderValue::from_static("theme=dark; nas_session=abc-123; other=value"),
         );
-        assert_eq!(query_token(Some("q=x")), None);
+        assert_eq!(cookie_token(&headers), Some("abc-123"));
+    }
+
+    #[test]
+    fn builds_http_only_session_cookie() {
+        let cookie = session_cookie("abc-123", 3600, true);
+        assert!(cookie.contains("nas_session=abc-123"));
+        assert!(cookie.contains("Max-Age=3600"));
+        assert!(cookie.contains("HttpOnly"));
+        assert!(cookie.contains("SameSite=Strict"));
+        assert!(cookie.contains("Secure"));
+    }
+
+    #[test]
+    fn clears_session_cookie() {
+        assert_eq!(
+            expired_session_cookie(false),
+            "nas_session=; Path=/api; Max-Age=0; HttpOnly; SameSite=Strict"
+        );
     }
 }

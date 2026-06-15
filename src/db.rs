@@ -120,12 +120,15 @@ pub async fn init_db(database_url: &str) -> anyhow::Result<SqlitePool> {
             file_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
             token_hash TEXT NOT NULL UNIQUE,
             created_at INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL,
             revoked_at INTEGER,
             download_count INTEGER NOT NULL DEFAULT 0
         );
         "#,
     )
     .await?;
+
+    ensure_shares_expires_at_column(&pool).await?;
 
     pool.execute(
         r#"
@@ -172,6 +175,27 @@ async fn ensure_nodes_file_date_column(pool: &SqlitePool) -> anyhow::Result<()> 
 
     if exists == 0 {
         pool.execute("ALTER TABLE nodes ADD COLUMN file_date_at INTEGER;")
+            .await?;
+    }
+
+    Ok(())
+}
+
+async fn ensure_shares_expires_at_column(pool: &SqlitePool) -> anyhow::Result<()> {
+    let exists = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(*)
+        FROM pragma_table_info('shares')
+        WHERE name = 'expires_at'
+        "#,
+    )
+    .fetch_one(pool)
+    .await?;
+
+    if exists == 0 {
+        pool.execute("ALTER TABLE shares ADD COLUMN expires_at INTEGER;")
+            .await?;
+        pool.execute("UPDATE shares SET expires_at = created_at + 3600 WHERE expires_at IS NULL;")
             .await?;
     }
 

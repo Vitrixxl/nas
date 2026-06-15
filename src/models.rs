@@ -80,6 +80,7 @@ pub struct ShareDto {
     pub id: String,
     pub file_id: String,
     pub created_at: i64,
+    pub expires_at: i64,
     pub revoked_at: Option<i64>,
     pub download_count: i64,
 }

@@ -5,6 +5,7 @@ import {
   type MouseEvent as ReactMouseEvent,
   type PointerEvent as ReactPointerEvent,
   type ReactNode,
+  type WheelEvent as ReactWheelEvent,
   useCallback,
   useEffect,
   useMemo,
@@ -15,6 +16,9 @@ import { createRoot } from "react-dom/client"
 import { BrowserRouter, Navigate, Route, Routes, useLocation, useNavigate, useParams, useSearchParams } from "react-router-dom"
 import {
   Check,
+  CheckCheck,
+  ChevronDown,
+  ChevronLeft,
   ChevronRight,
   Copy,
   Download,
@@ -36,17 +40,16 @@ import {
   Pencil,
   Plus,
   Play,
-  RotateCw,
   Search,
   Share2,
+  SlidersHorizontal,
   Trash2,
   Upload,
   Video,
-  Volume2,
-  VolumeX,
   X,
 } from "lucide-react"
 import { toast } from "sonner"
+import { AnimatePresence, motion } from "motion/react"
 
 import { Alert, AlertDescription } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
@@ -75,6 +78,7 @@ import {
 } from "@/components/ui/dropdown-menu"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover"
 import { Progress } from "@/components/ui/progress"
 import { Separator } from "@/components/ui/separator"
 import { Skeleton } from "@/components/ui/skeleton"
@@ -84,7 +88,6 @@ import { cn } from "@/lib/utils"
 import "./styles.css"
 
 const ROOT_ID = "00000000-0000-0000-0000-000000000000"
-const TOKEN_KEY = "nas.session.token"
 const CLIENT_ID_KEY = "nas.client.id"
 const GRID_SIZE_KEY = "nas.gallery.grid-size"
 const GRID_COLUMNS_KEY = "nas.gallery.grid-columns"
@@ -127,12 +130,14 @@ type ShareDto = {
   id: string
   file_id: string
   created_at: number
+  expires_at: number
   revoked_at: number | null
   download_count: number
 }
 
 type SortMode = "name" | "date"
 type SearchScope = "current" | "all"
+type MediaFilter = "all" | "image" | "video"
 type GridSize = "small" | "medium" | "large"
 type GalleryGridStyle = CSSProperties & {
   "--gallery-mobile-columns": number
@@ -164,18 +169,6 @@ type PendingFileImport = {
   files: File[]
   suggestedFolderName?: string
 }
-type PreviewUploadJob = {
-  source: "local-file"
-  file: File
-  fileId: string
-  name: string
-}
-type PreviewUploadStats = {
-  total: number
-  done: number
-  errors: number
-}
-type RemoteVideoPreviewStats = PreviewUploadStats
 type BatchShareLink = {
   fileId: string
   name: string
@@ -207,9 +200,7 @@ type RealtimeEvent =
 const MEDIA_ACCEPT = "image/*,video/*"
 const LIGHT_IMPORT_FILE_LIMIT = 20
 const LIGHT_IMPORT_BYTES_LIMIT = 384 * 1024 * 1024
-const LIGHT_IMPORT_BATCH_SIZE = 8
-const MOBILE_UPLOAD_CONCURRENCY = 2
-const DESKTOP_UPLOAD_CONCURRENCY = 4
+const MAX_ACTIVE_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024
 const MIN_GRID_COLUMNS = 1
 const MAX_GRID_COLUMNS = 12
 const SELECTION_LONG_PRESS_MS = 420
@@ -238,7 +229,28 @@ const MEDIA_EXTENSIONS = new Set([
 ])
 
 function App() {
-  const [token, setToken] = useState(() => sessionStorage.getItem(TOKEN_KEY))
+  const [authenticated, setAuthenticated] = useState<boolean | null>(null)
+
+  useEffect(() => {
+    let active = true
+    sessionStorage.removeItem("nas.session.token")
+
+    fetch("/api/auth/me")
+      .then((response) => {
+        if (active) setAuthenticated(response.ok)
+      })
+      .catch(() => {
+        if (active) setAuthenticated(false)
+      })
+
+    return () => {
+      active = false
+    }
+  }, [])
+
+  const login = useCallback(() => setAuthenticated(true), [])
+  const expireAuth = useCallback(() => setAuthenticated(false), [])
+  const authFallback = authenticated === null ? <SessionLoading /> : <Login onLogin={login} />
 
   return (
     <BrowserRouter>
@@ -246,43 +258,51 @@ function App() {
         <Route path="/share/:shareToken" element={<ShareRoute />} />
         <Route
           path="/"
-          element={token ? <Navigate to={folderRoute(ROOT_ID, "date")} replace /> : <Login onLogin={setToken} />}
+          element={
+            authenticated === null ? (
+              <SessionLoading />
+            ) : authenticated ? (
+              <Navigate to={folderRoute(ROOT_ID, "date")} replace />
+            ) : (
+              <Login onLogin={login} />
+            )
+          }
         />
         <Route
           path="/folder/:folderId"
           element={
-            token ? (
+            authenticated ? (
               <FileManager
-                token={token}
-                onAuthExpired={() => {
-                  sessionStorage.removeItem(TOKEN_KEY)
-                  setToken(null)
-                }}
+                onAuthExpired={expireAuth}
               />
             ) : (
-              <Login onLogin={setToken} />
+              authFallback
             )
           }
         />
         <Route
           path="/files"
           element={
-            token ? (
+            authenticated ? (
               <AllFilesView
-                token={token}
-                onAuthExpired={() => {
-                  sessionStorage.removeItem(TOKEN_KEY)
-                  setToken(null)
-                }}
+                onAuthExpired={expireAuth}
               />
             ) : (
-              <Login onLogin={setToken} />
+              authFallback
             )
           }
         />
-        <Route path="*" element={<Navigate to={token ? folderRoute(ROOT_ID, "date") : "/"} replace />} />
+        <Route path="*" element={<Navigate to={authenticated ? folderRoute(ROOT_ID, "date") : "/"} replace />} />
       </Routes>
     </BrowserRouter>
+  )
+}
+
+function SessionLoading() {
+  return (
+    <main className="grid min-h-svh place-items-center px-5 py-10 text-muted-foreground">
+      <Loader2 className="size-7 animate-spin" />
+    </main>
   )
 }
 
@@ -320,6 +340,17 @@ function parseSearchScope(value: string | null): SearchScope {
   return value === "all" ? "all" : "current"
 }
 
+function parseMediaFilter(value: string | null): MediaFilter {
+  return value === "image" || value === "video" ? value : "all"
+}
+
+/** Le filtre est applique cote API ; ce garde-fou evite d'inserer un media hors filtre via upload/temps reel. */
+function nodeMatchesMedia(node: NodeDto, mediaFilter: MediaFilter) {
+  if (mediaFilter === "all" || node.kind === "folder") return true
+  if (mediaFilter === "image") return node.mime_type?.startsWith("image/") ?? false
+  return node.mime_type?.startsWith("video/") ?? false
+}
+
 function parseGridSize(value: string | null): GridSize {
   return value === "small" || value === "large" ? value : "medium"
 }
@@ -338,13 +369,15 @@ function clampGridColumns(value: number) {
 function Brand({ className }: { className?: string }) {
   return (
     <div className={cn("flex items-center gap-2", className)}>
-      <HardDrive className="size-5 text-primary" />
-      <span className="text-base font-semibold tracking-tight">NAS</span>
+      <span className="grid size-9 place-items-center rounded-2xl bg-primary text-primary-foreground shadow-sm">
+        <HardDrive className="size-5" />
+      </span>
+      <span className="font-heading text-lg font-semibold tracking-tight text-foreground">NAS</span>
     </div>
   )
 }
 
-function Login({ onLogin }: { onLogin: (token: string) => void }) {
+function Login({ onLogin }: { onLogin: () => void }) {
   const [password, setPassword] = useState("")
   const [error, setError] = useState("")
   const [loading, setLoading] = useState(false)
@@ -365,9 +398,8 @@ function Login({ onLogin }: { onLogin: (token: string) => void }) {
         return
       }
 
-      const payload = (await response.json()) as { token: string }
-      sessionStorage.setItem(TOKEN_KEY, payload.token)
-      onLogin(payload.token)
+      await response.json().catch(() => null)
+      onLogin()
     } catch {
       setError("Serveur indisponible.")
     } finally {
@@ -429,11 +461,10 @@ function useClientId() {
   }, [])
 }
 
-function useAuthedRequest(token: string, onAuthExpired: () => void, clientId: string) {
+function useAuthedRequest(onAuthExpired: () => void, clientId: string) {
   return useCallback(
     async <T,>(path: string, init: RequestInit = {}) => {
       const headers = new Headers(init.headers)
-      headers.set("Authorization", `Bearer ${token}`)
       headers.set("X-NAS-Client-ID", clientId)
       if (init.body && !(init.body instanceof Blob) && !headers.has("Content-Type")) {
         headers.set("Content-Type", "application/json")
@@ -452,11 +483,11 @@ function useAuthedRequest(token: string, onAuthExpired: () => void, clientId: st
       }
       return (await response.json()) as T
     },
-    [clientId, onAuthExpired, token],
+    [clientId, onAuthExpired],
   )
 }
 
-function useRealtimeEvents(token: string, clientId: string, onEvent: (event: RealtimeEvent) => void) {
+function useRealtimeEvents(clientId: string, onEvent: (event: RealtimeEvent) => void) {
   const onEventRef = useRef(onEvent)
 
   useEffect(() => {
@@ -470,7 +501,7 @@ function useRealtimeEvents(token: string, clientId: string, onEvent: (event: Rea
 
     function connect() {
       const protocol = window.location.protocol === "https:" ? "wss:" : "ws:"
-      const params = new URLSearchParams({ token, client_id: clientId })
+      const params = new URLSearchParams({ client_id: clientId })
       socket = new WebSocket(`${protocol}//${window.location.host}/api/realtime?${params}`)
 
       socket.onmessage = (event) => {
@@ -496,7 +527,7 @@ function useRealtimeEvents(token: string, clientId: string, onEvent: (event: Rea
       window.clearTimeout(reconnectTimer)
       socket?.close()
     }
-  }, [clientId, token])
+  }, [clientId])
 }
 
 function useGridSize() {
@@ -520,116 +551,6 @@ function useGridColumns() {
   }, [])
 
   return [gridColumns, setGridColumns] as const
-}
-
-function useRemoteVideoPreviewQueue({
-  token,
-  clientId,
-  onPreviewed,
-  pausedRef,
-}: {
-  token: string
-  clientId: string
-  onPreviewed: (node: NodeDto) => void
-  pausedRef?: { current: boolean }
-}) {
-  const queueRef = useRef<NodeDto[]>([])
-  const queuedIdsRef = useRef<Set<string>>(new Set())
-  const attemptedIdsRef = useRef<Set<string>>(new Set())
-  const statsRef = useRef<RemoteVideoPreviewStats>({ total: 0, done: 0, errors: 0 })
-  const runnerRef = useRef(false)
-  const toastIdRef = useRef(`remote-preview:${crypto.randomUUID()}`)
-  const onPreviewedRef = useRef(onPreviewed)
-  const pausedStateRef = useRef(pausedRef)
-
-  useEffect(() => {
-    onPreviewedRef.current = onPreviewed
-  }, [onPreviewed])
-
-  useEffect(() => {
-    pausedStateRef.current = pausedRef
-  }, [pausedRef])
-
-  const showQueueToast = useCallback((label: string, state: "active" | "done" | "error" = "active") => {
-    const stats = statsRef.current
-    const processed = stats.done + stats.errors
-    const progress = stats.total > 0 ? Math.round((processed / stats.total) * 100) : 0
-    showUploadToast(toastIdRef.current, `${stats.total} miniatures video`, progress, label, state)
-  }, [])
-
-  const runQueue = useCallback(async () => {
-    if (runnerRef.current) return
-    runnerRef.current = true
-
-    try {
-      while (queueRef.current.length > 0) {
-        if (pausedStateRef.current?.current) {
-          await releaseBrowserMemory(450)
-          continue
-        }
-
-        const node = queueRef.current.shift()
-        if (!node) continue
-
-        const currentIndex = statsRef.current.done + statsRef.current.errors + 1
-        showQueueToast(`Video ${currentIndex}/${statsRef.current.total}`)
-
-        try {
-          const previewed = await uploadStoredVideoPreview(token, clientId, node)
-          if (previewed) {
-            onPreviewedRef.current(previewed)
-            statsRef.current = {
-              ...statsRef.current,
-              done: statsRef.current.done + 1,
-            }
-          } else {
-            statsRef.current = {
-              ...statsRef.current,
-              errors: statsRef.current.errors + 1,
-            }
-          }
-        } catch {
-          statsRef.current = {
-            ...statsRef.current,
-            errors: statsRef.current.errors + 1,
-          }
-        } finally {
-          queuedIdsRef.current.delete(node.id)
-          await releaseBrowserMemory(260)
-        }
-      }
-    } finally {
-      runnerRef.current = false
-    }
-
-    if (queueRef.current.length === 0 && statsRef.current.total > 0) {
-      const stats = statsRef.current
-      showQueueToast(
-        stats.errors > 0 ? `${stats.done} creees, ${stats.errors} erreurs` : "Termine",
-        stats.errors > 0 ? "error" : "done",
-      )
-      statsRef.current = { total: 0, done: 0, errors: 0 }
-      toastIdRef.current = `remote-preview:${crypto.randomUUID()}`
-    }
-  }, [clientId, showQueueToast, token])
-
-  return useCallback(
-    (node: NodeDto) => {
-      if (!shouldGenerateStoredVideoPreview(node)) return
-      if (attemptedIdsRef.current.has(node.id) || queuedIdsRef.current.has(node.id)) return
-
-      attemptedIdsRef.current.add(node.id)
-      queuedIdsRef.current.add(node.id)
-      queueRef.current.push(node)
-      statsRef.current = {
-        ...statsRef.current,
-        total: statsRef.current.total + 1,
-      }
-      showQueueToast("En attente")
-      void runQueue()
-    },
-    [runQueue, showQueueToast],
-  )
 }
 
 function lockSelectionScroll() {
@@ -936,7 +857,7 @@ function useNodeSelection(nodes: NodeDto[]) {
   }
 }
 
-function FileManager({ token, onAuthExpired }: { token: string; onAuthExpired: () => void }) {
+function FileManager({ onAuthExpired }: { onAuthExpired: () => void }) {
   const { folderId: routeFolderId = ROOT_ID } = useParams()
   const navigate = useNavigate()
   const location = useLocation()
@@ -944,6 +865,7 @@ function FileManager({ token, onAuthExpired }: { token: string; onAuthExpired: (
   const sortMode = parseSortMode(searchParams.get("sort"))
   const query = searchParams.get("q") ?? ""
   const searchScope = parseSearchScope(searchParams.get("scope"))
+  const mediaFilter = parseMediaFilter(searchParams.get("media"))
   const viewerId = searchParams.get(VIEW_PARAM)
   const searchActive = query.trim().length > 0
   const [data, setData] = useState<FolderResponse | null>(null)
@@ -967,21 +889,18 @@ function FileManager({ token, onAuthExpired }: { token: string; onAuthExpired: (
   const fileInput = useRef<HTMLInputElement>(null)
   const directoryInput = useRef<HTMLInputElement | null>(null)
   const clientId = useClientId()
-  const request = useAuthedRequest(token, onAuthExpired, clientId)
+  const request = useAuthedRequest(onAuthExpired, clientId)
   const [gridSize, setGridSize] = useGridSize()
   const [gridColumns, setGridColumns] = useGridColumns()
-  const uploadActiveRef = useRef(false)
-  const previewQueueRef = useRef<PreviewUploadJob[]>([])
-  const previewStatsRef = useRef<PreviewUploadStats>({ total: 0, done: 0, errors: 0 })
-  const previewRunnerRef = useRef(false)
-  const previewToastIdRef = useRef(`preview:${crypto.randomUUID()}`)
   const duplicatePromptQueueRef = useRef<Promise<void>>(Promise.resolve())
 
   const fetchFolder = useCallback(
-    async (id: string, nextSortMode: SortMode) => {
+    async (id: string, nextSortMode: SortMode, nextMedia: MediaFilter) => {
       setLoading(true)
       try {
-        setData(await request<FolderResponse>(`/api/folders/${id}?sort=${nextSortMode}`))
+        const params = new URLSearchParams({ sort: nextSortMode })
+        if (nextMedia !== "all") params.set("media", nextMedia)
+        setData(await request<FolderResponse>(`/api/folders/${id}?${params}`))
       } catch (err) {
         toast.error(err instanceof Error ? err.message : "Chargement impossible.")
       } finally {
@@ -991,9 +910,22 @@ function FileManager({ token, onAuthExpired }: { token: string; onAuthExpired: (
     [request],
   )
 
+  const setMediaFilter = useCallback(
+    (next: MediaFilter) => {
+      const params = new URLSearchParams(searchParams)
+      if (next === "all") params.delete("media")
+      else params.set("media", next)
+      navigate(
+        { pathname: location.pathname, search: params.toString() ? `?${params}` : "" },
+        { replace: true },
+      )
+    },
+    [location.pathname, navigate, searchParams],
+  )
+
   useEffect(() => {
-    void fetchFolder(routeFolderId, sortMode)
-  }, [fetchFolder, routeFolderId, sortMode])
+    void fetchFolder(routeFolderId, sortMode, mediaFilter)
+  }, [fetchFolder, routeFolderId, sortMode, mediaFilter])
 
   const fetchSearch = useCallback(
     async (folderId: string, nextSortMode: SortMode, nextQuery: string, nextScope: SearchScope) => {
@@ -1045,14 +977,17 @@ function FileManager({ token, onAuthExpired }: { token: string; onAuthExpired: (
     navigate(folderRoute(id, sortMode))
   }
 
-  function openViewer(node: NodeDto) {
+  function openViewer(node: NodeDto, replace = false) {
     const params = new URLSearchParams(searchParams)
     params.set(VIEW_PARAM, node.id)
     setViewerNode(node)
-    navigate({
-      pathname: location.pathname,
-      search: params.toString() ? `?${params}` : "",
-    })
+    navigate(
+      {
+        pathname: location.pathname,
+        search: params.toString() ? `?${params}` : "",
+      },
+      { replace },
+    )
   }
 
   function closeViewer() {
@@ -1091,6 +1026,7 @@ function FileManager({ token, onAuthExpired }: { token: string; onAuthExpired: (
   }
 
   function upsertVisibleChild(node: NodeDto) {
+    if (!nodeMatchesMedia(node, mediaFilter)) return
     setData((current) => {
       if (!current || node.parent_id !== current.folder.id) return current
       return {
@@ -1123,7 +1059,7 @@ function FileManager({ token, onAuthExpired }: { token: string; onAuthExpired: (
       setDetailsNode((current) => (current?.id === renamed.id ? renamed : current))
       setViewerNode((current) => (current?.id === renamed.id ? renamed : current))
       toast.success("Element renomme")
-      await fetchFolder(routeFolderId, sortMode)
+      await fetchFolder(routeFolderId, sortMode, mediaFilter)
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Renommage impossible.")
     }
@@ -1139,7 +1075,7 @@ function FileManager({ token, onAuthExpired }: { token: string; onAuthExpired: (
       setDetailsNode((current) => (current?.id === target.id ? null : current))
       setViewerNode((current) => (current?.id === target.id ? null : current))
       toast.success(target.kind === "folder" ? "Dossier supprime" : "Fichier supprime")
-      await fetchFolder(routeFolderId, sortMode)
+      await fetchFolder(routeFolderId, sortMode, mediaFilter)
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Suppression impossible.")
     }
@@ -1231,76 +1167,6 @@ function FileManager({ token, onAuthExpired }: { token: string; onAuthExpired: (
     return queuedDecision
   }
 
-  function showPreviewQueueToast(label: string, state: "active" | "done" | "error" = "active") {
-    const stats = previewStatsRef.current
-    const processed = stats.done + stats.errors
-    const progress = stats.total > 0 ? Math.round((processed / stats.total) * 100) : 0
-    showUploadToast(previewToastIdRef.current, `${stats.total} miniatures`, progress, label, state)
-  }
-
-  function enqueuePreviewUpload(file: File, node: NodeDto, lightImport: boolean) {
-    if (isVideoFile(file)) return
-    if (!shouldQueueClientPreview(file, lightImport)) return
-
-    previewQueueRef.current.push({ source: "local-file", file, fileId: node.id, name: node.name })
-    previewStatsRef.current = {
-      ...previewStatsRef.current,
-      total: previewStatsRef.current.total + 1,
-    }
-    showPreviewQueueToast("En attente")
-    void runPreviewQueue()
-  }
-
-  async function runPreviewQueue() {
-    if (previewRunnerRef.current) return
-    previewRunnerRef.current = true
-
-    try {
-      while (previewQueueRef.current.length > 0) {
-        if (uploadActiveRef.current) {
-          await releaseBrowserMemory(350)
-          continue
-        }
-
-        const job = previewQueueRef.current.shift()
-        if (!job) continue
-
-        const currentIndex = previewStatsRef.current.done + previewStatsRef.current.errors + 1
-        showPreviewQueueToast(`Miniature ${currentIndex}/${previewStatsRef.current.total}`)
-
-        try {
-          const previewed = await uploadClientPreview(token, clientId, job.fileId, job.file)
-          if (previewed) {
-            upsertClientNode(previewed)
-          }
-          previewStatsRef.current = {
-            ...previewStatsRef.current,
-            done: previewStatsRef.current.done + 1,
-          }
-        } catch {
-          previewStatsRef.current = {
-            ...previewStatsRef.current,
-            errors: previewStatsRef.current.errors + 1,
-          }
-        } finally {
-          await releaseBrowserMemory(220)
-        }
-      }
-    } finally {
-      previewRunnerRef.current = false
-    }
-
-    if (previewQueueRef.current.length === 0 && !uploadActiveRef.current && previewStatsRef.current.total > 0) {
-      const stats = previewStatsRef.current
-      showPreviewQueueToast(
-        stats.errors > 0 ? `${stats.done} creees, ${stats.errors} erreurs` : "Termine",
-        stats.errors > 0 ? "error" : "done",
-      )
-      previewStatsRef.current = { total: 0, done: 0, errors: 0 }
-      previewToastIdRef.current = `preview:${crypto.randomUUID()}`
-    }
-  }
-
   function upsertClientNode(node: NodeDto) {
     setData((current) => {
       if (!current) return current
@@ -1345,134 +1211,96 @@ function FileManager({ token, onAuthExpired }: { token: string; onAuthExpired: (
     const batchToastId = lightImport ? `upload-batch:${crypto.randomUUID()}` : null
     if (lightImport && batchToastId) {
       toast.info("Mode import leger", {
-        description: "Import par lots sans miniatures locales pour limiter la memoire de Brave.",
+        description: "Progression groupee pour limiter les notifications.",
       })
       showUploadToast(batchToastId, `${mediaFiles.length} medias`, 0, "Preparation")
     }
 
-    const uploadConcurrency = uploadConcurrencyFor(mediaFiles, lightImport)
-    if (mediaFiles.length > 1 && uploadConcurrency > 1) {
-      toast.info("Uploads paralleles", {
-        description: `${uploadConcurrency} fichiers envoyes en meme temps.`,
+    if (mediaFiles.length > 1) {
+      toast.info("Fenetre d'upload", {
+        description: "Jusqu'a 2 Go de medias envoyes en meme temps.",
       })
     }
 
-    uploadActiveRef.current = true
-    try {
-      const folderCache = new Map<string, string>()
-      const progressByIndex = new Array<number>(mediaFiles.length).fill(0)
-      const batchSize = lightImport ? LIGHT_IMPORT_BATCH_SIZE : mediaFiles.length
-      const totalBatches = Math.max(1, Math.ceil(mediaFiles.length / batchSize))
+    const folderCache = new Map<string, string>()
+    const progressByIndex = new Array<number>(mediaFiles.length).fill(0)
 
-      const uploadFileAtIndex = async (fileIndex: number) => {
-        const file = mediaFiles[fileIndex]
-        const folderSegments = importFolderSegments(file, strippedRoot)
-        const toastId = batchToastId ?? `upload:${crypto.randomUUID()}`
-        const fileName = uploadDisplayName(file, strippedRoot)
-        const toastName = lightImport ? `Import ${fileIndex + 1}/${mediaFiles.length}` : fileName
-        const updateToast = (progress: number, label: string, state: "active" | "done" | "error" = "active") => {
-          const boundedProgress = Math.max(0, Math.min(100, progress))
-          const toastState = lightImport ? "active" : state
-          const nextProgress = lightImport
-            ? Math.min(
-                99,
-                Math.round(
-                  progressByIndex.reduce((total, current, index) => {
-                    return total + (index === fileIndex ? Math.max(current, boundedProgress) : current)
-                  }, 0) / mediaFiles.length,
-                ),
-              )
-            : boundedProgress
+    const uploadFileAtIndex = async (fileIndex: number) => {
+      const file = mediaFiles[fileIndex]
+      const folderSegments = importFolderSegments(file, strippedRoot)
+      const toastId = batchToastId ?? `upload:${crypto.randomUUID()}`
+      const fileName = uploadDisplayName(file, strippedRoot)
+      const toastName = lightImport ? `Import ${fileIndex + 1}/${mediaFiles.length}` : fileName
+      const updateToast = (progress: number, label: string, state: "active" | "done" | "error" = "active") => {
+        const boundedProgress = Math.max(0, Math.min(100, progress))
+        const toastState = lightImport ? "active" : state
+        const nextProgress = lightImport
+          ? Math.min(
+              99,
+              Math.round(
+                progressByIndex.reduce((total, current, index) => {
+                  return total + (index === fileIndex ? Math.max(current, boundedProgress) : current)
+                }, 0) / mediaFiles.length,
+              ),
+            )
+          : boundedProgress
 
-          progressByIndex[fileIndex] = Math.max(progressByIndex[fileIndex] ?? 0, boundedProgress)
-          showUploadToast(toastId, toastName, nextProgress, lightImport ? `${label} - ${fileName}` : label, toastState)
-        }
-
-        updateToast(0, "Envoi")
-
-        try {
-          const targetFolderId = folderSegments.length
-            ? await ensureFolderPath(request, uploadRootId, folderSegments, folderCache, upsertVisibleChild)
-            : uploadRootId
-          const uploaded = await uploadFileWithConflictHandling({
-            request,
-            token,
-            clientId,
-            folderId: targetFolderId,
-            file,
-            onProgress: (progress) => updateToast(progress, "Envoi"),
-            getDuplicateDecision: async (fileName) => {
-              if (duplicatePolicy) {
-                return { action: duplicatePolicy, applyToAll: false }
-              }
-
-              const decision = await askDuplicateConflict(fileName)
-              if (decision.applyToAll) {
-                duplicatePolicy = decision.action
-              }
-              return decision
-            },
-          })
-
-          if (!uploaded) {
-            updateToast(100, "Ignore", "done")
-            return
-          }
-
-          upsertVisibleChild(uploaded)
-          if (isVideoFile(file)) {
-            queueVideoPreview(uploaded)
-          } else {
-            enqueuePreviewUpload(file, uploaded, lightImport)
-          }
-          successCount += 1
-          updateToast(100, "Termine", "done")
-        } catch (err) {
-          errorCount += 1
-          updateToast(100, err instanceof Error ? err.message : "Upload impossible", "error")
-        } finally {
-          await releaseBrowserMemory()
-        }
+        progressByIndex[fileIndex] = Math.max(progressByIndex[fileIndex] ?? 0, boundedProgress)
+        showUploadToast(toastId, toastName, nextProgress, lightImport ? `${label} - ${fileName}` : label, toastState)
       }
 
-      for (let batchStart = 0; batchStart < mediaFiles.length; batchStart += batchSize) {
-        const batchNumber = Math.floor(batchStart / batchSize) + 1
-        const batchEnd = Math.min(batchStart + batchSize, mediaFiles.length)
-        if (lightImport && batchToastId) {
-          showUploadToast(
-            batchToastId,
-            `${mediaFiles.length} medias`,
-            Math.round((batchStart / mediaFiles.length) * 100),
-            `Lot ${batchNumber}/${totalBatches}`,
-          )
-        }
+      updateToast(0, "Envoi")
 
-        const batchIndexes = Array.from({ length: batchEnd - batchStart }, (_, index) => batchStart + index)
-        let nextBatchIndex = 0
-        const workerCount = Math.min(uploadConcurrency, batchIndexes.length)
-        await Promise.all(
-          Array.from({ length: workerCount }, async () => {
-            for (;;) {
-              const fileIndex = batchIndexes[nextBatchIndex]
-              nextBatchIndex += 1
-              if (fileIndex === undefined) return
-              await uploadFileAtIndex(fileIndex)
+      try {
+        const targetFolderId = folderSegments.length
+          ? await ensureFolderPath(request, uploadRootId, folderSegments, folderCache, upsertVisibleChild)
+          : uploadRootId
+        const previewPromise = createPreviewForUpload(file)
+        const uploaded = await uploadFileWithConflictHandling({
+          request,
+          clientId,
+          folderId: targetFolderId,
+          file,
+          onProgress: (progress) => updateToast(progress, "Envoi"),
+          getDuplicateDecision: async (fileName) => {
+            if (duplicatePolicy) {
+              return { action: duplicatePolicy, applyToAll: false }
             }
-          }),
-        )
 
-        if (lightImport) {
-          await releaseBrowserMemory(250)
+            const decision = await askDuplicateConflict(fileName)
+            if (decision.applyToAll) {
+              duplicatePolicy = decision.action
+            }
+            return decision
+          },
+        })
+
+        if (!uploaded) {
+          updateToast(100, "Ignore", "done")
+          return
         }
-      }
 
-      if (lightImport && batchToastId) {
-        const label = errorCount > 0 ? `${successCount} importes, ${errorCount} erreurs` : "Termine"
-        showUploadToast(batchToastId, `${mediaFiles.length} medias`, 100, label, errorCount > 0 ? "error" : "done")
+        upsertVisibleChild(uploaded)
+        void uploadPreparedPreview(clientId, uploaded.id, previewPromise, upsertClientNode)
+        successCount += 1
+        updateToast(100, "Termine", "done")
+      } catch (err) {
+        errorCount += 1
+        updateToast(100, err instanceof Error ? err.message : "Upload impossible", "error")
+      } finally {
+        await releaseBrowserMemory()
       }
-    } finally {
-      uploadActiveRef.current = false
-      void runPreviewQueue()
+    }
+
+    await runUploadsWithinByteWindow(
+      mediaFiles.length,
+      (fileIndex) => uploadWindowBytes(mediaFiles[fileIndex]),
+      uploadFileAtIndex,
+    )
+
+    if (lightImport && batchToastId) {
+      const label = errorCount > 0 ? `${successCount} importes, ${errorCount} erreurs` : "Termine"
+      showUploadToast(batchToastId, `${mediaFiles.length} medias`, 100, label, errorCount > 0 ? "error" : "done")
     }
   }
 
@@ -1505,13 +1333,9 @@ function FileManager({ token, onAuthExpired }: { token: string; onAuthExpired: (
     fileInput.current?.click()
   }
 
-  const queueVideoPreview = useRemoteVideoPreviewQueue({
-    token,
-    clientId,
-    onPreviewed: upsertClientNode,
-  })
   const visibleNodes = searchActive ? searchResults : (data?.children ?? [])
   const groups = useMemo(() => groupNodesBySort(visibleNodes, sortMode), [visibleNodes, sortMode])
+  const mediaNodes = useMemo(() => flattenGroupNodes(groups).filter(isFileNode), [groups])
   const selection = useNodeSelection(visibleNodes)
   const selectedFiles = useMemo(() => selection.selectedNodes.filter(isFileNode), [selection.selectedNodes])
 
@@ -1531,11 +1355,13 @@ function FileManager({ token, onAuthExpired }: { token: string; onAuthExpired: (
 
       if (event.type === "node_upsert") {
         const node = event.node
-        setData((current) => {
-          if (!current) return current
-          const children = reconcileNodeChildren(current.children, node, current.folder.id, sortMode)
-          return children === current.children ? current : { ...current, children }
-        })
+        if (nodeMatchesMedia(node, mediaFilter)) {
+          setData((current) => {
+            if (!current) return current
+            const children = reconcileNodeChildren(current.children, node, current.folder.id, sortMode)
+            return children === current.children ? current : { ...current, children }
+          })
+        }
         setSearchResults((current) =>
           reconcileSearchNodes(current, node, query, searchScope, data?.folder ?? null, sortMode),
         )
@@ -1553,21 +1379,17 @@ function FileManager({ token, onAuthExpired }: { token: string; onAuthExpired: (
       setDetailsNode((current) => (current?.id === event.id ? null : current))
       setViewerNode((current) => (current?.id === event.id ? null : current))
     },
-    [clientId, data?.folder, query, searchScope, sortMode],
+    [clientId, data?.folder, mediaFilter, query, searchScope, sortMode],
   )
 
-  useRealtimeEvents(token, clientId, handleRealtimeEvent)
+  useRealtimeEvents(clientId, handleRealtimeEvent)
 
   return (
     <div className="min-h-svh" onContextMenu={preventAppContextMenu}>
       <main className="mx-auto w-full max-w-6xl px-4 pb-24 pt-[env(safe-area-inset-top)] sm:pb-12 sm:pt-6">
         <SearchControls
-          value={searchValue}
-          onValueChange={setSearchValue}
-          scope={searchScope}
-          onScopeChange={changeSearchScope}
-          currentLabel={data?.folder.name || "Racine"}
-          loading={searchLoading}
+          mediaFilter={mediaFilter}
+          onMediaFilterChange={setMediaFilter}
           gridSize={gridSize}
           onGridSizeChange={setGridSize}
           gridColumns={gridColumns}
@@ -1647,37 +1469,40 @@ function FileManager({ token, onAuthExpired }: { token: string; onAuthExpired: (
           }}
         />
 
-        <div className="hidden sm:mb-4 sm:flex sm:w-auto sm:gap-2">
-          <Button
-            variant="outline"
-            className="h-9 flex-none text-sm"
-            onClick={() => setCreateOpen(true)}
-          >
-            <FolderPlus />
-            Nouveau
-          </Button>
-          <Button
-            variant="outline"
-            className="h-9 flex-none text-sm"
-            onClick={() => navigate(allFilesRoute(sortMode))}
-          >
-            <Files />
-            Tous
-          </Button>
-          <Button
-            className="h-9 flex-none text-sm"
-            onClick={() => fileInput.current?.click()}
-          >
-            <Upload />
-            Fichiers
-          </Button>
-          <Button
-            className="h-9 flex-none text-sm"
-            onClick={openDirectoryImport}
-          >
-            <FolderUp />
-            Dossier
-          </Button>
+        <div className="hidden sm:mb-5 sm:flex sm:items-center sm:justify-between sm:gap-4 sm:rounded-2xl sm:border sm:border-border sm:bg-card sm:px-4 sm:py-2.5 sm:shadow-sm">
+          <Brand />
+          <div className="flex items-center gap-2">
+            <Button
+              variant="outline"
+              className="h-9 flex-none text-sm"
+              onClick={() => setCreateOpen(true)}
+            >
+              <FolderPlus />
+              Nouveau
+            </Button>
+            <Button
+              variant="outline"
+              className="h-9 flex-none text-sm"
+              onClick={() => navigate(allFilesRoute(sortMode))}
+            >
+              <Files />
+              Tous
+            </Button>
+            <Button
+              className="h-9 flex-none text-sm"
+              onClick={() => fileInput.current?.click()}
+            >
+              <Upload />
+              Fichiers
+            </Button>
+            <Button
+              className="h-9 flex-none text-sm"
+              onClick={openDirectoryImport}
+            >
+              <FolderUp />
+              Dossier
+            </Button>
+          </div>
         </div>
 
         {data && data.breadcrumbs.length > 1 && (
@@ -1700,11 +1525,10 @@ function FileManager({ token, onAuthExpired }: { token: string; onAuthExpired: (
             searchLoading ? (
               <LoadingGrid gridSize={gridSize} gridColumns={gridColumns} />
             ) : searchResults.length > 0 ? (
-              <GroupedNodeGrid
-                groups={groups}
-                sortMode={sortMode}
-                token={token}
-                gridSize={gridSize}
+            <GroupedNodeGrid
+              groups={groups}
+              sortMode={sortMode}
+              gridSize={gridSize}
                 gridColumns={gridColumns}
                 showPath
                 onOpen={(node) => (node.kind === "folder" ? openFolder(node.id) : openViewer(node))}
@@ -1722,7 +1546,6 @@ function FileManager({ token, onAuthExpired }: { token: string; onAuthExpired: (
             <GroupedNodeGrid
               groups={groups}
               sortMode={sortMode}
-              token={token}
               gridSize={gridSize}
               gridColumns={gridColumns}
               onOpen={(node) => (node.kind === "folder" ? openFolder(node.id) : openViewer(node))}
@@ -1773,23 +1596,25 @@ function FileManager({ token, onAuthExpired }: { token: string; onAuthExpired: (
         }}
       />
       <DetailsDialog
-        token={token}
         node={detailsNode}
         showPath={searchActive}
         onOpenChange={(open) => !open && setDetailsNode(null)}
-        onDownload={(node) => void downloadProtectedFile(token, node)}
+        onDownload={(node) => void downloadProtectedFile(node)}
         onShare={(node) => setShareNode(node)}
         onRename={openRename}
         onDelete={setDeleteTarget}
         onOpenParent={(node) => openFolder(node.parent_id ?? ROOT_ID)}
       />
       <MediaViewer
-        token={token}
         node={viewerNode}
+        nodes={mediaNodes}
+        onNavigate={(node) => openViewer(node, true)}
         onOpenChange={(open) => !open && closeViewer()}
+        onShare={(node) => setShareNode(node)}
+        onDownload={(node) => void downloadProtectedFile(node)}
+        onDelete={(node) => setDeleteTarget(node)}
       />
       <ShareDialog
-        token={token}
         node={shareNode}
         onOpenChange={(open) => !open && setShareNode(null)}
         request={request}
@@ -1803,12 +1628,13 @@ function FileManager({ token, onAuthExpired }: { token: string; onAuthExpired: (
   )
 }
 
-function AllFilesView({ token, onAuthExpired }: { token: string; onAuthExpired: () => void }) {
+function AllFilesView({ onAuthExpired }: { onAuthExpired: () => void }) {
   const navigate = useNavigate()
   const location = useLocation()
   const [searchParams] = useSearchParams()
   const sortMode = parseSortMode(searchParams.get("sort"))
   const query = searchParams.get("q") ?? ""
+  const mediaFilter = parseMediaFilter(searchParams.get("media"))
   const viewerId = searchParams.get(VIEW_PARAM)
   const [searchValue, setSearchValue] = useState(query)
   const [files, setFiles] = useState<NodeDto[]>([])
@@ -1822,22 +1648,23 @@ function AllFilesView({ token, onAuthExpired }: { token: string; onAuthExpired: 
   const [detailsNode, setDetailsNode] = useState<NodeDto | null>(null)
   const [viewerNode, setViewerNode] = useState<NodeDto | null>(null)
   const clientId = useClientId()
-  const request = useAuthedRequest(token, onAuthExpired, clientId)
+  const request = useAuthedRequest(onAuthExpired, clientId)
   const [gridSize, setGridSize] = useGridSize()
   const [gridColumns, setGridColumns] = useGridColumns()
 
   const fetchFiles = useCallback(
-    async (nextSortMode: SortMode, nextQuery: string) => {
+    async (nextSortMode: SortMode, nextQuery: string, nextMedia: MediaFilter) => {
       setLoading(true)
       try {
         const params = new URLSearchParams({ sort: nextSortMode })
         if (nextQuery.trim()) {
           params.set("q", nextQuery.trim())
         }
+        if (nextMedia !== "all") params.set("media", nextMedia)
         const payload = await request<FilesResponse>(`/api/files?${params}`)
         setFiles(payload.files)
       } catch (err) {
-        toast.error(err instanceof Error ? err.message : "Recherche impossible.")
+        toast.error(err instanceof Error ? err.message : "Chargement impossible.")
       } finally {
         setLoading(false)
       }
@@ -1845,13 +1672,26 @@ function AllFilesView({ token, onAuthExpired }: { token: string; onAuthExpired: 
     [request],
   )
 
+  const setMediaFilter = useCallback(
+    (next: MediaFilter) => {
+      const params = new URLSearchParams(searchParams)
+      if (next === "all") params.delete("media")
+      else params.set("media", next)
+      navigate(
+        { pathname: location.pathname, search: params.toString() ? `?${params}` : "" },
+        { replace: true },
+      )
+    },
+    [location.pathname, navigate, searchParams],
+  )
+
   useEffect(() => {
     setSearchValue(query)
   }, [query])
 
   useEffect(() => {
-    void fetchFiles(sortMode, query)
-  }, [fetchFiles, query, sortMode])
+    void fetchFiles(sortMode, query, mediaFilter)
+  }, [fetchFiles, query, sortMode, mediaFilter])
 
   useEffect(() => {
     if (searchValue === query) return
@@ -1861,14 +1701,17 @@ function AllFilesView({ token, onAuthExpired }: { token: string; onAuthExpired: 
     return () => window.clearTimeout(timer)
   }, [navigate, query, searchValue, sortMode])
 
-  function openViewer(node: NodeDto) {
+  function openViewer(node: NodeDto, replace = false) {
     const params = new URLSearchParams(searchParams)
     params.set(VIEW_PARAM, node.id)
     setViewerNode(node)
-    navigate({
-      pathname: location.pathname,
-      search: params.toString() ? `?${params}` : "",
-    })
+    navigate(
+      {
+        pathname: location.pathname,
+        search: params.toString() ? `?${params}` : "",
+      },
+      { replace },
+    )
   }
 
   function closeViewer() {
@@ -1906,7 +1749,7 @@ function AllFilesView({ token, onAuthExpired }: { token: string; onAuthExpired: 
       setDetailsNode((current) => (current?.id === renamed.id ? renamed : current))
       setViewerNode((current) => (current?.id === renamed.id ? renamed : current))
       toast.success("Fichier renomme")
-      await fetchFiles(sortMode, query)
+      await fetchFiles(sortMode, query, mediaFilter)
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Renommage impossible.")
     }
@@ -1922,7 +1765,7 @@ function AllFilesView({ token, onAuthExpired }: { token: string; onAuthExpired: 
       setDetailsNode((current) => (current?.id === target.id ? null : current))
       setViewerNode((current) => (current?.id === target.id ? null : current))
       toast.success("Fichier supprime")
-      await fetchFiles(sortMode, query)
+      await fetchFiles(sortMode, query, mediaFilter)
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Suppression impossible.")
     }
@@ -1962,6 +1805,7 @@ function AllFilesView({ token, onAuthExpired }: { token: string; onAuthExpired: 
   const groups = useMemo(() => groupNodesBySort(files, sortMode), [files, sortMode])
   const selection = useNodeSelection(files)
   const selectedFiles = useMemo(() => selection.selectedNodes.filter(isFileNode), [selection.selectedNodes])
+  const mediaNodes = useMemo(() => flattenGroupNodes(groups).filter(isFileNode), [groups])
 
   useEffect(() => {
     if (!viewerId) {
@@ -1979,7 +1823,9 @@ function AllFilesView({ token, onAuthExpired }: { token: string; onAuthExpired: 
 
       if (event.type === "node_upsert") {
         const node = event.node
-        setFiles((current) => reconcileAllFiles(current, node, query))
+        if (nodeMatchesMedia(node, mediaFilter)) {
+          setFiles((current) => reconcileAllFiles(current, node, query))
+        }
         setDetailsNode((current) => (current?.id === node.id ? node : current))
         setViewerNode((current) => (current?.id === node.id && node.kind === "file" ? node : current))
         return
@@ -1989,25 +1835,17 @@ function AllFilesView({ token, onAuthExpired }: { token: string; onAuthExpired: 
       setDetailsNode((current) => (current?.id === event.id ? null : current))
       setViewerNode((current) => (current?.id === event.id ? null : current))
     },
-    [clientId, query],
+    [clientId, mediaFilter, query],
   )
 
-  useRealtimeEvents(token, clientId, handleRealtimeEvent)
+  useRealtimeEvents(clientId, handleRealtimeEvent)
 
   return (
     <div className="min-h-svh" onContextMenu={preventAppContextMenu}>
       <main className="mx-auto w-full max-w-6xl px-4 pb-10 pt-[env(safe-area-inset-top)] sm:pt-6">
         <SearchControls
-          value={searchValue}
-          onValueChange={setSearchValue}
-          scope="all"
-          onScopeChange={(nextScope) => {
-            if (nextScope === "current") {
-              navigate(folderRoute(ROOT_ID, sortMode, query, "current"))
-            }
-          }}
-          currentLabel="Racine"
-          loading={loading}
+          mediaFilter={mediaFilter}
+          onMediaFilterChange={setMediaFilter}
           gridSize={gridSize}
           onGridSizeChange={setGridSize}
           gridColumns={gridColumns}
@@ -2029,7 +1867,6 @@ function AllFilesView({ token, onAuthExpired }: { token: string; onAuthExpired: 
           <GroupedNodeGrid
             groups={groups}
             sortMode={sortMode}
-            token={token}
             gridSize={gridSize}
             gridColumns={gridColumns}
             showPath
@@ -2040,9 +1877,9 @@ function AllFilesView({ token, onAuthExpired }: { token: string; onAuthExpired: 
             onNodeClick={selection.handleClick}
           />
         ) : (
-          <Card className="grid min-h-[42svh] place-items-center border-dashed">
+          <Card className="grid min-h-[42svh] place-items-center border-dashed border-border bg-card">
             <CardContent className="grid max-w-xs justify-items-center gap-4 text-center">
-              <div className="grid size-14 place-items-center rounded-2xl bg-muted text-muted-foreground">
+              <div className="grid size-16 place-items-center rounded-full bg-primary/12 text-primary">
                 <Search className="size-7" />
               </div>
               <div className="grid gap-1">
@@ -2070,23 +1907,25 @@ function AllFilesView({ token, onAuthExpired }: { token: string; onAuthExpired: 
         onConfirm={() => void submitBatchDelete()}
       />
       <DetailsDialog
-        token={token}
         node={detailsNode}
         showPath
         onOpenChange={(open) => !open && setDetailsNode(null)}
-        onDownload={(node) => void downloadProtectedFile(token, node)}
+        onDownload={(node) => void downloadProtectedFile(node)}
         onShare={(node) => setShareNode(node)}
         onRename={openRename}
         onDelete={setDeleteTarget}
         onOpenParent={(node) => navigate(folderRoute(node.parent_id ?? ROOT_ID, sortMode))}
       />
       <MediaViewer
-        token={token}
         node={viewerNode}
+        nodes={mediaNodes}
+        onNavigate={(node) => openViewer(node, true)}
         onOpenChange={(open) => !open && closeViewer()}
+        onShare={(node) => setShareNode(node)}
+        onDownload={(node) => void downloadProtectedFile(node)}
+        onDelete={(node) => setDeleteTarget(node)}
       />
       <ShareDialog
-        token={token}
         node={shareNode}
         onOpenChange={(open) => !open && setShareNode(null)}
         request={request}
@@ -2124,11 +1963,11 @@ function SelectionBar({
   if (count === 0) return null
 
   return (
-    <div className="sticky top-[7.25rem] z-30 mb-4 flex items-center justify-between gap-3 rounded-lg border bg-background/95 px-3 py-2 shadow-sm backdrop-blur-xl sm:top-3">
-      <Badge variant="default">{count} selectionne{count > 1 ? "s" : ""}</Badge>
-      <div className="flex items-center gap-1.5">
+    <div className="sticky top-[3.75rem] z-30 mb-3 flex items-center justify-between gap-3 bg-background py-1.5 sm:top-3">
+      <Badge variant="default" className="h-7 px-3 text-xs">{count} selectionne{count > 1 ? "s" : ""}</Badge>
+      <div className="flex items-center gap-0.5">
         <Button variant="ghost" size="icon-sm" onClick={onSelectAll}>
-          <Check />
+          <CheckCheck />
           <span className="sr-only">Tout selectionner</span>
         </Button>
         <Button variant="ghost" size="icon-sm" onClick={onShare} disabled={fileCount === 0}>
@@ -2179,7 +2018,7 @@ function MobileActionMenu({
     <>
       <Button
         size="icon"
-        className="fixed right-4 bottom-[calc(1rem+env(safe-area-inset-bottom))] z-40 size-14 rounded-full shadow-2xl sm:hidden"
+        className="fixed right-4 bottom-[calc(1rem+env(safe-area-inset-bottom))] z-40 size-14 rounded-full shadow-lg sm:hidden"
         onClick={() => setOpen(true)}
       >
         <Plus className="size-7" />
@@ -2188,10 +2027,11 @@ function MobileActionMenu({
       <Dialog open={open} onOpenChange={setOpen}>
         <DialogContent
           showCloseButton={false}
+          animateContent={false}
           className="w-screen max-w-none place-items-center border-0 bg-transparent p-0 shadow-none ring-0 sm:hidden"
         >
           <DialogTitle className="sr-only">Actions</DialogTitle>
-          <div className="w-[min(88vw,23rem)] rounded-3xl border bg-background/92 p-4 shadow-2xl ring-1 ring-primary/25 backdrop-blur-2xl">
+          <div className="w-[min(88vw,23rem)] rounded-2xl border border-border bg-popover p-5 shadow-xl">
             <div className="mb-4 grid gap-1 px-1">
               <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Actions</p>
               <p className="text-lg font-semibold leading-tight">Ajouter au stockage</p>
@@ -2202,8 +2042,8 @@ function MobileActionMenu({
                 const firstSingle = actions.length === 3 && action === actions[0]
                 const tileClassName = cn(
                   "h-24 flex-col gap-2 rounded-2xl border px-3 text-center text-sm shadow-sm transition-all active:scale-[0.98]",
-                  "border-border bg-secondary/90 text-secondary-foreground hover:border-primary/70 hover:bg-secondary",
-                  pressed && "border-primary bg-primary text-primary-foreground shadow-lg",
+                  "border-border bg-card text-foreground hover:bg-muted",
+                  pressed && "border-primary bg-primary text-primary-foreground",
                   firstSingle && "col-span-2",
                 )
                 if (action.fileInput) {
@@ -2256,30 +2096,130 @@ function MobileActionMenu({
   )
 }
 
-function SearchControls({
+/** Icone grille NxN (2x2, 3x3, 4x4) qui reflete la densite choisie. */
+function GridSizeIcon({ columns, className }: { columns: number; className?: string }) {
+  const n = Math.max(2, Math.min(4, Math.round(columns)))
+  const pad = 2.5
+  const gap = n === 2 ? 3 : n === 3 ? 2.2 : 1.6
+  const inner = 24 - pad * 2
+  const cell = (inner - gap * (n - 1)) / n
+  const radius = Math.min(1.4, cell / 3)
+  const cells: ReactNode[] = []
+  for (let row = 0; row < n; row += 1) {
+    for (let col = 0; col < n; col += 1) {
+      cells.push(
+        <rect
+          key={`${row}-${col}`}
+          x={pad + col * (cell + gap)}
+          y={pad + row * (cell + gap)}
+          width={cell}
+          height={cell}
+          rx={radius}
+        />,
+      )
+    }
+  }
+  return (
+    <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" className={className}>
+      {cells}
+    </svg>
+  )
+}
+
+const MEDIA_FILTER_LABEL: Record<MediaFilter, string> = {
+  all: "Images et videos",
+  image: "Images",
+  video: "Videos",
+}
+
+/** Popover de filtre : bascule multiple images / videos (filtre applique cote API). */
+function MediaFilterControl({
   value,
-  onValueChange,
-  scope,
-  onScopeChange,
-  currentLabel,
-  loading,
+  onChange,
+}: {
+  value: MediaFilter
+  onChange: (value: MediaFilter) => void
+}) {
+  const imageOn = value === "all" || value === "image"
+  const videoOn = value === "all" || value === "video"
+
+  function toggle(kind: "image" | "video") {
+    const next = { image: imageOn, video: videoOn }
+    next[kind] = !next[kind]
+    if (!next.image && !next.video) {
+      onChange(kind === "image" ? "video" : "image")
+      return
+    }
+    onChange(next.image && next.video ? "all" : next.image ? "image" : "video")
+  }
+
+  return (
+    <Popover>
+      <PopoverTrigger asChild>
+        <Button variant="outline" className="h-10 w-full justify-start gap-2 px-3.5 font-medium sm:h-11">
+          <SlidersHorizontal className="size-4 text-muted-foreground" />
+          <span className="truncate">{MEDIA_FILTER_LABEL[value]}</span>
+          <ChevronDown className="ml-auto size-4 shrink-0 text-muted-foreground" />
+        </Button>
+      </PopoverTrigger>
+      <PopoverContent align="start">
+        <p className="px-2 pt-1 pb-2 text-xs font-medium text-muted-foreground">Afficher</p>
+        <div className="grid grid-cols-2 gap-1.5">
+          <MediaToggle active={imageOn} label="Images" icon={<Image className="size-5" />} onClick={() => toggle("image")} />
+          <MediaToggle active={videoOn} label="Videos" icon={<Video className="size-5" />} onClick={() => toggle("video")} />
+        </div>
+      </PopoverContent>
+    </Popover>
+  )
+}
+
+function MediaToggle({
+  active,
+  label,
+  icon,
+  onClick,
+}: {
+  active: boolean
+  label: string
+  icon: ReactNode
+  onClick: () => void
+}) {
+  return (
+    <button
+      type="button"
+      aria-pressed={active}
+      onClick={onClick}
+      className={cn(
+        "flex flex-col items-center justify-center gap-1.5 rounded-xl border p-3 text-xs font-semibold transition-colors",
+        active
+          ? "border-primary bg-primary/10 text-primary"
+          : "border-border bg-card text-muted-foreground hover:bg-muted",
+      )}
+    >
+      {icon}
+      {label}
+      <Check className={cn("size-3.5 transition-opacity", active ? "opacity-100" : "opacity-0")} />
+    </button>
+  )
+}
+
+function SearchControls({
+  mediaFilter,
+  onMediaFilterChange,
   gridSize,
   onGridSizeChange,
   gridColumns,
   onGridColumnsChange,
 }: {
-  value: string
-  onValueChange: (value: string) => void
-  scope: SearchScope
-  onScopeChange: (scope: SearchScope) => void
-  currentLabel: string
-  loading: boolean
+  mediaFilter: MediaFilter
+  onMediaFilterChange: (mediaFilter: MediaFilter) => void
   gridSize: GridSize
   onGridSizeChange: (gridSize: GridSize) => void
   gridColumns: number
   onGridColumnsChange: (gridColumns: number) => void
 }) {
   const gridSizeLabel = GRID_SIZE_OPTIONS.find((option) => option.value === gridSize)?.label ?? "Moyenne"
+  const gridSizeColumns = GRID_SIZE_OPTIONS.find((option) => option.value === gridSize)?.columns ?? 3
   const [gridColumnsValue, setGridColumnsValue] = useState(String(gridColumns))
 
   useEffect(() => {
@@ -2297,31 +2237,10 @@ function SearchControls({
   }
 
   return (
-    <div className="sticky top-0 z-30 -mx-4 mb-3 grid gap-2 border-b bg-background/90 px-4 pt-1 pb-2 backdrop-blur-xl sm:static sm:mx-0 sm:mb-4 sm:gap-3 sm:border-0 sm:bg-transparent sm:px-0 sm:pt-0 sm:pb-0 sm:backdrop-blur-none">
+    <div className="sticky top-0 z-30 -mx-4 mb-2 grid gap-2 bg-background px-4 pt-2 pb-2 sm:static sm:mx-0 sm:mb-5 sm:gap-3 sm:rounded-2xl sm:border sm:border-border sm:bg-card sm:p-3 sm:shadow-sm">
       <div className="grid grid-cols-[1fr_auto] gap-1.5 sm:gap-2">
-        <div className="relative">
-          <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
-          <Input
-            value={value}
-            onChange={(event) => onValueChange(event.target.value)}
-            className="h-10 rounded-full pr-10 pl-9 sm:h-11"
-            placeholder="Rechercher"
-          />
-          {loading ? (
-            <Loader2 className="absolute right-3 top-1/2 size-4 -translate-y-1/2 animate-spin text-muted-foreground" />
-          ) : value ? (
-            <Button
-              variant="ghost"
-              size="icon-sm"
-              className="absolute right-1.5 top-1/2 -translate-y-1/2"
-              onClick={() => onValueChange("")}
-            >
-              <X />
-              <span className="sr-only">Effacer</span>
-            </Button>
-          ) : null}
-        </div>
-        <div className="hidden h-11 items-center gap-2 rounded-full border bg-background px-3 shadow-xs sm:flex">
+        <MediaFilterControl value={mediaFilter} onChange={onMediaFilterChange} />
+        <div className="hidden h-11 items-center gap-2 rounded-2xl border border-border bg-muted px-3 sm:flex">
           <Files className="size-4 text-muted-foreground" />
           <Label htmlFor="grid-columns" className="text-xs text-muted-foreground">
             Colonnes
@@ -2335,20 +2254,20 @@ function SearchControls({
             value={gridColumnsValue}
             onChange={(event) => changeGridColumns(event.target.value)}
             onBlur={() => setGridColumnsValue(String(gridColumns))}
-            className="h-8 w-16 rounded-full px-2 text-center"
+            className="h-8 w-16 rounded-lg bg-card px-2 text-center"
           />
         </div>
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
             <Button variant="outline" size="icon" className="size-10 sm:hidden">
-              <Files />
+              <GridSizeIcon columns={gridSizeColumns} className="size-5" />
               <span className="sr-only">Taille de la grille: {gridSizeLabel}</span>
             </Button>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="end">
             {GRID_SIZE_OPTIONS.map((option) => (
               <DropdownMenuItem key={option.value} onSelect={() => onGridSizeChange(option.value)}>
-                <Files />
+                <GridSizeIcon columns={option.columns} className="size-4" />
                 {option.label}
                 {gridSize === option.value && <Check className="ml-auto" />}
               </DropdownMenuItem>
@@ -2356,37 +2275,15 @@ function SearchControls({
           </DropdownMenuContent>
         </DropdownMenu>
       </div>
-      <div className="grid grid-cols-2 gap-2 sm:flex sm:items-center">
-        <Button
-          variant={scope === "current" ? "secondary" : "outline"}
-          size="sm"
-          className="min-w-0"
-          onClick={() => onScopeChange("current")}
-        >
-          <Folder />
-          <span className="truncate">Ce dossier</span>
-        </Button>
-        <Button
-          variant={scope === "all" ? "secondary" : "outline"}
-          size="sm"
-          onClick={() => onScopeChange("all")}
-        >
-          <Files />
-          Tous les dossiers
-        </Button>
-        <p className="hidden min-w-0 text-xs text-muted-foreground sm:block">
-          {scope === "current" ? `Recherche recursive dans ${currentLabel || "Racine"}.` : "Recherche recursive partout."}
-        </p>
-      </div>
     </div>
   )
 }
 
 function SearchEmptyState({ query, scope }: { query: string; scope: SearchScope }) {
   return (
-    <Card className="grid min-h-[42svh] place-items-center border-dashed">
+    <Card className="grid min-h-[42svh] place-items-center border-dashed border-border bg-card">
       <CardContent className="grid max-w-xs justify-items-center gap-4 text-center">
-        <div className="grid size-14 place-items-center rounded-2xl bg-muted text-muted-foreground">
+        <div className="grid size-16 place-items-center rounded-full bg-primary/12 text-primary">
           <Search className="size-7" />
         </div>
         <div className="grid gap-1">
@@ -2461,7 +2358,7 @@ function DropZone({ children, onFiles }: { children: ReactNode; onFiles: (files:
   return (
     <div
       className={cn(
-        "relative min-h-[48svh] rounded-xl transition-colors",
+        "relative min-h-[48svh] rounded-lg transition-colors",
         dragging && "outline-2 outline-offset-4 outline-dashed outline-primary",
       )}
       onDragOver={(event) => {
@@ -2476,7 +2373,7 @@ function DropZone({ children, onFiles }: { children: ReactNode; onFiles: (files:
       }}
     >
       {dragging && (
-        <div className="pointer-events-none absolute inset-0 z-10 grid place-items-center rounded-xl bg-background/85 backdrop-blur-sm">
+        <div className="pointer-events-none absolute inset-0 z-10 grid place-items-center rounded-2xl border-2 border-dashed border-primary bg-secondary/90">
           <div className="grid justify-items-center gap-2 text-primary">
             <Upload className="size-8" />
             <p className="text-sm font-medium">Depose pour envoyer</p>
@@ -2490,18 +2387,23 @@ function DropZone({ children, onFiles }: { children: ReactNode; onFiles: (files:
 
 function EmptyState() {
   return (
-    <div className="grid min-h-[46svh] place-items-center text-center text-sm font-medium text-muted-foreground">
-      Dossier vide
+    <div className="grid min-h-[46svh] place-items-center text-center">
+      <div className="grid justify-items-center gap-4 rounded-2xl border border-dashed border-border bg-card px-10 py-12 text-sm font-medium text-muted-foreground shadow-sm">
+        <span className="grid size-16 place-items-center rounded-full bg-secondary text-secondary-foreground">
+          <Folder className="size-8" />
+        </span>
+        Dossier vide
+      </div>
     </div>
   )
 }
 
 function LoadingGrid({ gridSize, gridColumns }: { gridSize: GridSize; gridColumns: number }) {
   return (
-    <section className="gallery-grid grid gap-1 sm:gap-1.5" style={galleryGridStyle(gridSize, gridColumns)}>
+    <section className="gallery-grid grid gap-2 sm:gap-3" style={galleryGridStyle(gridSize, gridColumns)}>
       {Array.from({ length: 10 }).map((_, index) => (
         <div key={index}>
-          <Skeleton className="aspect-square w-full rounded-md" />
+          <Skeleton className="aspect-square w-full rounded-lg" />
         </div>
       ))}
     </section>
@@ -2511,7 +2413,6 @@ function LoadingGrid({ gridSize, gridColumns }: { gridSize: GridSize; gridColumn
 function GroupedNodeGrid({
   groups,
   sortMode,
-  token,
   gridSize,
   gridColumns,
   showPath = false,
@@ -2523,7 +2424,6 @@ function GroupedNodeGrid({
 }: {
   groups: NodeGroup[]
   sortMode: SortMode
-  token: string
   gridSize: GridSize
   gridColumns: number
   showPath?: boolean
@@ -2553,7 +2453,7 @@ function GroupedNodeGrid({
       {groups.map((group) => {
         const yearCollapsed = collapsedGroups.has(group.id)
         return (
-          <div key={group.id} className="grid gap-2">
+          <div key={group.id} className="grid gap-3">
             {sortMode === "date" && (
               <DateGroupHeader
                 id={group.id}
@@ -2570,39 +2470,34 @@ function GroupedNodeGrid({
                   {group.children.map((month) => {
                     const monthCollapsed = collapsedGroups.has(month.id)
                     return (
-                      <div key={month.id} className="grid gap-1.5">
-                        <DateGroupHeader
-                          id={month.id}
-                          label={month.label}
-                          count={month.nodes.length}
-                          collapsed={monthCollapsed}
-                          level="month"
-                          onToggle={toggleGroup}
+                      <DateGroupBox
+                        key={month.id}
+                        id={month.id}
+                        label={month.label}
+                        count={month.nodes.length}
+                        collapsed={monthCollapsed}
+                        onToggle={toggleGroup}
+                      >
+                        <NodeGrid
+                          nodes={month.nodes}
+                          sortMode={sortMode}
+                          gridSize={gridSize}
+                          gridColumns={gridColumns}
+                          showPath={showPath}
+                          selectedIds={selectedIds}
+                          selectionMode={selectionMode}
+                          nextIndex={() => index++}
+                          onOpen={onOpen}
+                          onNodePointerDown={onNodePointerDown}
+                          onNodeClick={onNodeClick}
                         />
-                        {!monthCollapsed && (
-                          <NodeGrid
-                            nodes={month.nodes}
-                            token={token}
-                            sortMode={sortMode}
-                            gridSize={gridSize}
-                            gridColumns={gridColumns}
-                            showPath={showPath}
-                            selectedIds={selectedIds}
-                            selectionMode={selectionMode}
-                            nextIndex={() => index++}
-                            onOpen={onOpen}
-                            onNodePointerDown={onNodePointerDown}
-                            onNodeClick={onNodeClick}
-                          />
-                        )}
-                      </div>
+                      </DateGroupBox>
                     )
                   })}
                 </div>
               ) : (
                 <NodeGrid
                   nodes={group.nodes}
-                  token={token}
                   sortMode={sortMode}
                   gridSize={gridSize}
                   gridColumns={gridColumns}
@@ -2641,27 +2536,93 @@ function DateGroupHeader({
     <button
       type="button"
       className={cn(
-        "sticky -mx-0.5 flex items-center justify-between gap-2 border px-2 shadow-sm backdrop-blur-md",
-        level === "year"
-          ? "top-0 z-20 rounded-lg border-border/80 bg-background/92 py-1.5"
-          : "top-8 z-10 rounded-md border-border/60 bg-muted/55 py-1",
+        "group/group-header sticky flex w-full items-center gap-3 bg-background transition-colors",
+        level === "year" ? "top-0 z-20 py-2.5" : "top-10 z-10 py-2 pl-3",
       )}
       onClick={() => onToggle(id)}
     >
-      <span className="flex min-w-0 items-center gap-1.5">
-        <ChevronRight className={cn("size-3.5 shrink-0 text-muted-foreground transition-transform", !collapsed && "rotate-90")} />
-        <span className={cn("truncate font-medium", level === "year" ? "text-xs" : "text-[11px] text-muted-foreground")}>{label}</span>
+      <span
+        className={cn(
+          "grid place-items-center rounded-full transition-colors",
+          level === "year" ? "size-6 bg-primary/12 text-primary" : "size-5 bg-muted text-muted-foreground",
+        )}
+      >
+        <ChevronRight className={cn("size-3.5 shrink-0 transition-transform", !collapsed && "rotate-90")} />
       </span>
-      <span className="shrink-0 rounded-full bg-secondary/90 px-1.5 py-0.5 text-[10px] leading-none text-secondary-foreground">
+      <span
+        className={cn(
+          "truncate font-heading font-semibold tracking-tight",
+          level === "year" ? "text-base text-foreground" : "text-sm text-muted-foreground",
+        )}
+      >
+        {label}
+      </span>
+      <span className="h-px flex-1 bg-border" />
+      <span
+        className={cn(
+          "shrink-0 rounded-full px-2 py-0.5 text-[11px] font-semibold leading-none tabular-nums",
+          level === "year" ? "bg-primary/12 text-primary" : "bg-muted text-muted-foreground",
+        )}
+      >
         {count}
       </span>
     </button>
   )
 }
 
+/** Bloc mensuel : une boite arrondie qui contient ses medias et se replie en douceur. */
+function DateGroupBox({
+  id,
+  label,
+  count,
+  collapsed,
+  onToggle,
+  children,
+}: {
+  id: string
+  label: string
+  count: number
+  collapsed: boolean
+  onToggle: (id: string) => void
+  children: ReactNode
+}) {
+  return (
+    <div className="overflow-hidden rounded-2xl border border-border bg-card shadow-sm">
+      <button
+        type="button"
+        className="flex w-full items-center gap-3 px-3 py-2.5 text-left transition-colors hover:bg-muted/60"
+        onClick={() => onToggle(id)}
+        aria-expanded={!collapsed}
+      >
+        <span className="grid size-6 shrink-0 place-items-center rounded-full bg-secondary text-secondary-foreground">
+          <ChevronRight className={cn("size-3.5 transition-transform duration-200", !collapsed && "rotate-90")} />
+        </span>
+        <span className="truncate font-heading text-sm font-semibold tracking-tight text-foreground">{label}</span>
+        <span className="h-px flex-1 bg-border" />
+        <span className="shrink-0 rounded-full bg-muted px-2 py-0.5 text-[11px] font-semibold leading-none tabular-nums text-muted-foreground">
+          {count}
+        </span>
+      </button>
+      <AnimatePresence initial={false}>
+        {!collapsed && (
+          <motion.div
+            key="content"
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: "auto", opacity: 1 }}
+            exit={{ height: 0, opacity: 0 }}
+            transition={{ duration: 0.26, ease: [0.4, 0, 0.2, 1] }}
+            className="overflow-hidden"
+          >
+            <div className="px-2 pb-2 sm:px-2.5 sm:pb-2.5">{children}</div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </div>
+  )
+}
+
 function NodeGrid({
   nodes,
-  token,
   sortMode,
   gridSize,
   gridColumns,
@@ -2674,7 +2635,6 @@ function NodeGrid({
   onNodeClick,
 }: {
   nodes: NodeDto[]
-  token: string
   sortMode: SortMode
   gridSize: GridSize
   gridColumns: number
@@ -2692,7 +2652,6 @@ function NodeGrid({
         <NodeCard
           key={node.id}
           node={node}
-          token={token}
           sortMode={sortMode}
           showPath={showPath}
           index={nextIndex()}
@@ -2715,7 +2674,6 @@ function NodeGrid({
 
 function NodeCard({
   node,
-  token,
   sortMode,
   showPath = false,
   index,
@@ -2725,7 +2683,6 @@ function NodeCard({
   onOpen,
 }: {
   node: NodeDto
-  token: string
   sortMode: SortMode
   showPath?: boolean
   index: number
@@ -2742,8 +2699,7 @@ function NodeCard({
     <div
       data-node-id={node.id}
       data-node-index={index}
-      className="group relative animate-in fade-in-0 slide-in-from-bottom-2 fill-mode-both"
-      style={{ animationDelay: `${Math.min(index, 12) * 35}ms` }}
+      className="group relative"
     >
       <button
         type="button"
@@ -2759,41 +2715,41 @@ function NodeCard({
       >
         <div
           className={cn(
-            "relative grid aspect-square place-items-center overflow-hidden rounded-md transition-all",
+            "relative grid aspect-square place-items-center overflow-hidden rounded-lg border transition-all group-hover:-translate-y-0.5 group-hover:shadow-md",
             isFolder
-              ? "bg-primary/10 text-primary"
+              ? "border-secondary-foreground/15 bg-secondary text-secondary-foreground shadow-sm"
               : node.preview_url
-                ? "bg-transparent text-muted-foreground"
-                : "bg-muted text-muted-foreground",
-            selected && "ring-primary ring-offset-background ring-[3px] ring-offset-2",
-            selectionMode && !selected && "brightness-90",
+                ? "border-border bg-muted text-muted-foreground"
+                : "border-border bg-muted text-muted-foreground shadow-sm",
+            selectionMode && !selected && "opacity-70",
           )}
         >
           {isFolder ? (
-            <div className="grid size-full place-items-center p-2 text-center">
-              <div className="grid max-w-full justify-items-center gap-1.5">
-                <Folder className="size-7 shrink-0" />
-                <span className="line-clamp-3 max-w-full text-[11px] font-medium leading-[1.05] break-words sm:text-xs">
-                  {node.name}
-                </span>
-              </div>
+            <div className="flex size-full flex-col items-center justify-center gap-2 p-3 text-center">
+              <span className="grid size-11 place-items-center rounded-lg bg-card text-secondary-foreground shadow-sm">
+                <Folder className="size-6 shrink-0" />
+              </span>
+              <span className="line-clamp-2 max-w-full text-[11px] font-semibold leading-tight break-words sm:text-xs">
+                {node.name}
+              </span>
             </div>
           ) : node.preview_url ? (
-            <ProtectedPreview token={token} src={node.preview_url} className="rounded-md" />
-          ) : isImage ? (
-            <Image className="size-8" />
-          ) : isVideo ? (
-            <Video className="size-8" />
+            <ProtectedPreview src={node.preview_url} className="rounded-lg" />
           ) : (
-            <FileIcon className="size-8" />
+            <span className="grid size-12 place-items-center rounded-full bg-card text-muted-foreground shadow-sm">
+              {isImage ? <Image className="size-6" /> : isVideo ? <Video className="size-6" /> : <FileIcon className="size-6" />}
+            </span>
           )}
           {isVideo && (
-            <div className="absolute right-2 bottom-2 rounded-full bg-background/90 p-1.5 text-foreground shadow-sm backdrop-blur-sm">
+            <div className="absolute right-2 bottom-2 rounded-full bg-foreground/75 p-1.5 text-background shadow-sm">
               <Video className="size-3.5" />
             </div>
           )}
           {selected && (
-            <div className="absolute top-2 left-2 grid size-7 place-items-center rounded-full bg-primary text-primary-foreground shadow-sm">
+            <div className="pointer-events-none absolute inset-0 z-30 rounded-lg ring-[3px] ring-inset ring-primary" />
+          )}
+          {selected && (
+            <div className="absolute top-2 left-2 z-40 grid size-7 place-items-center rounded-full bg-primary text-primary-foreground shadow-sm ring-2 ring-background">
               <Check className="size-4" />
             </div>
           )}
@@ -2812,14 +2768,12 @@ function NodeCard({
 }
 
 function ProtectedPreview({
-  token,
   src,
   fit = "cover",
   className,
   showFallback = true,
   onImageLoad,
 }: {
-  token: string
   src: string
   fit?: "cover" | "contain"
   className?: string
@@ -2832,7 +2786,7 @@ function ProtectedPreview({
     let active = true
     let nextUrl: string | null = null
 
-    fetch(src, { headers: { Authorization: `Bearer ${token}` } })
+    fetch(src)
       .then((response) => {
         if (!response.ok) throw new Error("preview")
         return response.blob()
@@ -2850,7 +2804,7 @@ function ProtectedPreview({
       active = false
       if (nextUrl) URL.revokeObjectURL(nextUrl)
     }
-  }, [src, token])
+  }, [src])
 
   if (!objectUrl) {
     return showFallback ? <Image className={cn("size-8", className)} /> : null
@@ -3129,40 +3083,512 @@ function DuplicateConflictDialog({
   )
 }
 
+/** Precharge le media plein voisin pour que l'atterrissage apres swipe soit instantane. */
+function MediaPrefetch({ node }: { node: NodeDto }) {
+  const src = mediaInlineUrl(node)
+  if (node.mime_type?.startsWith("video/")) {
+    return <video src={src} preload="auto" muted tabIndex={-1} aria-hidden className="size-0" />
+  }
+  return <img src={src} alt="" tabIndex={-1} aria-hidden className="size-0" />
+}
+
+/** Slot voisin du carrousel : miniature floue agrandie + miniature nette contenue, affichee sans charger le plein. */
+function MediaPreviewSlide({ node }: { node: NodeDto }) {
+  const isVideo = node.mime_type?.startsWith("video/")
+  return (
+    <div className="relative size-full overflow-hidden bg-background">
+      {node.preview_url ? (
+        <>
+          <img
+            src={node.preview_url}
+            alt=""
+            aria-hidden
+            draggable={false}
+            className="pointer-events-none absolute inset-0 size-full scale-110 object-cover blur-2xl brightness-90"
+          />
+          <img
+            src={node.preview_url}
+            alt=""
+            draggable={false}
+            className="relative z-10 size-full object-contain"
+          />
+        </>
+      ) : (
+        <div className="grid size-full place-items-center text-muted-foreground">
+          {isVideo ? <Video className="size-12" /> : <Image className="size-12" />}
+        </div>
+      )}
+      {isVideo && (
+        <div className="absolute inset-0 z-20 grid place-items-center">
+          <span className="grid size-14 place-items-center rounded-full bg-foreground/55 text-background">
+            <Play className="ml-0.5 size-6 fill-current" />
+          </span>
+        </div>
+      )}
+    </div>
+  )
+}
+
+const CAROUSEL_ANIMATION_MS = 210
+const CAROUSEL_SWIPE_MIN_PX = 52
+const CAROUSEL_SWIPE_MAX_PX = 150
+const CAROUSEL_SWIPE_PROJECT_MS = 170
+const CAROUSEL_EDGE_RESISTANCE = 0.28
+const CAROUSEL_WHEEL_SETTLE_MS = 120
+
+type MediaActionHandlers = {
+  onShare?: (node: NodeDto) => void
+  onDownload?: (node: NodeDto) => void
+  onDelete?: (node: NodeDto) => void
+  onClose: () => void
+}
+type FullscreenTargetRef = { current: HTMLElement | null }
+
 function MediaViewer({
-  token,
   node,
+  nodes,
+  onNavigate,
   onOpenChange,
+  onShare,
+  onDownload,
+  onDelete,
 }: {
-  token: string
   node: NodeDto | null
+  nodes: NodeDto[]
+  onNavigate: (node: NodeDto) => void
   onOpenChange: (open: boolean) => void
+  onShare?: (node: NodeDto) => void
+  onDownload?: (node: NodeDto) => void
+  onDelete?: (node: NodeDto) => void
 }) {
-  const isImage = node?.mime_type?.startsWith("image/")
-  const isVideo = node?.mime_type?.startsWith("video/")
-  const source = node ? mediaInlineUrl(token, node) : ""
+  const index = node ? nodes.findIndex((candidate) => candidate.id === node.id) : -1
+  const [chromeVisible, setChromeVisible] = useState(true)
+  const wasOpenRef = useRef(false)
+  const viewerSurfaceRef = useRef<HTMLDivElement | null>(null)
+  const carouselRef = useRef<HTMLDivElement | null>(null)
+  const navigationTimerRef = useRef(0)
+  const suppressClickUntilRef = useRef(0)
+  const gestureRef = useRef({
+    pointerId: null as number | null,
+    startX: 0,
+    startY: 0,
+    lastX: 0,
+    lastTime: 0,
+    velocityX: 0,
+    offset: 0,
+    dragging: false,
+    cancelled: false,
+  })
+  const wheelRef = useRef({ delta: 0, settleTimer: 0 })
+  const [trackOffset, setTrackOffset] = useState(0)
+  const [trackAnimating, setTrackAnimating] = useState(false)
+  const [dragging, setDragging] = useState(false)
+  const { width } = useViewportSize()
+
+  const prev = index > 0 ? nodes[index - 1] : null
+  const next = index >= 0 && index < nodes.length - 1 ? nodes[index + 1] : null
+  const slots = node ? [prev, node, next].filter((candidate): candidate is NodeDto => !!candidate) : []
+  const activeSlot = prev ? 1 : 0
+  const activeIsVideo = node?.mime_type?.startsWith("video/") ?? false
+
+  // Chrome visible a chaque nouvelle ouverture, conserve entre les navigations.
+  useEffect(() => {
+    if (node && !wasOpenRef.current) setChromeVisible(true)
+    wasOpenRef.current = !!node
+  }, [node])
+
+  const carouselWidth = useCallback(() => carouselRef.current?.clientWidth || width, [width])
+
+  const clearNavigationTimer = useCallback(() => {
+    if (!navigationTimerRef.current) return
+    window.clearTimeout(navigationTimerRef.current)
+    navigationTimerRef.current = 0
+  }, [])
+
+  const clearWheelTimer = useCallback(() => {
+    if (!wheelRef.current.settleTimer) return
+    window.clearTimeout(wheelRef.current.settleTimer)
+    wheelRef.current.settleTimer = 0
+  }, [])
+
+  const swipeThreshold = useCallback(() => {
+    const w = carouselWidth()
+    return Math.min(CAROUSEL_SWIPE_MAX_PX, Math.max(CAROUSEL_SWIPE_MIN_PX, w * 0.18))
+  }, [carouselWidth])
+
+  const applyEdgeResistance = useCallback(
+    (offset: number) => {
+      const w = carouselWidth()
+      const limited = w > 0 ? Math.max(-w, Math.min(w, offset)) : offset
+      if ((limited > 0 && !prev) || (limited < 0 && !next)) return limited * CAROUSEL_EDGE_RESISTANCE
+      return limited
+    },
+    [carouselWidth, next, prev],
+  )
+
+  const animateBack = useCallback(() => {
+    clearNavigationTimer()
+    setDragging(false)
+    setTrackAnimating(true)
+    setTrackOffset(0)
+    navigationTimerRef.current = window.setTimeout(() => {
+      navigationTimerRef.current = 0
+      setTrackAnimating(false)
+    }, CAROUSEL_ANIMATION_MS)
+  }, [clearNavigationTimer])
+
+  const goTo = useCallback(
+    (dir: number) => {
+      const target = nodes[index + dir]
+      if (!target) {
+        animateBack()
+        return
+      }
+
+      clearNavigationTimer()
+      clearWheelTimer()
+      wheelRef.current.delta = 0
+      setDragging(false)
+
+      const w = carouselWidth()
+      if (w === 0) {
+        setTrackAnimating(false)
+        setTrackOffset(0)
+        onNavigate(target)
+        return
+      }
+
+      setTrackAnimating(true)
+      setTrackOffset(-dir * w)
+      navigationTimerRef.current = window.setTimeout(() => {
+        navigationTimerRef.current = 0
+        setTrackAnimating(false)
+        setTrackOffset(0)
+        onNavigate(target)
+      }, CAROUSEL_ANIMATION_MS)
+    },
+    [animateBack, carouselWidth, clearNavigationTimer, clearWheelTimer, index, nodes, onNavigate],
+  )
+
+  useEffect(() => {
+    if (!node) return
+    clearNavigationTimer()
+    clearWheelTimer()
+    wheelRef.current.delta = 0
+    gestureRef.current.pointerId = null
+    setDragging(false)
+    setTrackAnimating(false)
+    setTrackOffset(0)
+  }, [clearNavigationTimer, clearWheelTimer, node?.id])
+
+  useEffect(() => {
+    return () => {
+      clearNavigationTimer()
+      clearWheelTimer()
+    }
+  }, [clearNavigationTimer, clearWheelTimer])
+
+  const handlePointerDown = useCallback(
+    (event: ReactPointerEvent<HTMLDivElement>) => {
+      if (!node || trackAnimating) return
+      if (event.pointerType === "mouse" && event.button !== 0) return
+
+      clearNavigationTimer()
+      clearWheelTimer()
+      wheelRef.current.delta = 0
+      setTrackAnimating(false)
+
+      const now = performance.now()
+      gestureRef.current = {
+        pointerId: event.pointerId,
+        startX: event.clientX,
+        startY: event.clientY,
+        lastX: event.clientX,
+        lastTime: now,
+        velocityX: 0,
+        offset: 0,
+        dragging: false,
+        cancelled: false,
+      }
+
+      try {
+        event.currentTarget.setPointerCapture(event.pointerId)
+      } catch {
+        // Le navigateur peut refuser la capture si le geste est deja annule.
+      }
+    },
+    [clearNavigationTimer, clearWheelTimer, node, trackAnimating],
+  )
+
+  const handlePointerMove = useCallback(
+    (event: ReactPointerEvent<HTMLDivElement>) => {
+      const gesture = gestureRef.current
+      if (gesture.pointerId !== event.pointerId || gesture.cancelled) return
+
+      const dx = event.clientX - gesture.startX
+      const dy = event.clientY - gesture.startY
+      const absX = Math.abs(dx)
+      const absY = Math.abs(dy)
+
+      if (!gesture.dragging) {
+        if (absX < 6 && absY < 6) return
+        if (absY > absX * 1.25 && absY > 12) {
+          gesture.cancelled = true
+          return
+        }
+        gesture.dragging = true
+        setDragging(true)
+      }
+
+      const now = performance.now()
+      const elapsed = Math.max(1, now - gesture.lastTime)
+      gesture.velocityX = (event.clientX - gesture.lastX) / elapsed
+      gesture.lastX = event.clientX
+      gesture.lastTime = now
+      gesture.offset = applyEdgeResistance(dx)
+
+      setTrackOffset(gesture.offset)
+      event.preventDefault()
+    },
+    [applyEdgeResistance],
+  )
+
+  const handlePointerEnd = useCallback(
+    (event: ReactPointerEvent<HTMLDivElement>) => {
+      const gesture = gestureRef.current
+      if (gesture.pointerId !== event.pointerId) return
+
+      try {
+        event.currentTarget.releasePointerCapture(event.pointerId)
+      } catch {
+        // Ignore les echecs de liberation de capture.
+      }
+
+      gesture.pointerId = null
+      if (!gesture.dragging) return
+
+      event.preventDefault()
+      event.stopPropagation()
+      suppressClickUntilRef.current = performance.now() + 350
+
+      const projected = gesture.offset + gesture.velocityX * CAROUSEL_SWIPE_PROJECT_MS
+      const threshold = swipeThreshold()
+      if (projected <= -threshold && next) {
+        goTo(1)
+      } else if (projected >= threshold && prev) {
+        goTo(-1)
+      } else {
+        animateBack()
+      }
+    },
+    [animateBack, goTo, next, prev, swipeThreshold],
+  )
+
+  const handleWheel = useCallback(
+    (event: ReactWheelEvent<HTMLDivElement>) => {
+      if (trackAnimating) return
+
+      const dominantDelta = Math.abs(event.deltaX) >= Math.abs(event.deltaY) ? event.deltaX : event.shiftKey ? event.deltaY : 0
+      if (dominantDelta === 0) return
+
+      event.preventDefault()
+      clearNavigationTimer()
+      clearWheelTimer()
+
+      const wheel = wheelRef.current
+      wheel.delta += dominantDelta
+      const offset = applyEdgeResistance(-wheel.delta)
+      setDragging(false)
+      setTrackAnimating(false)
+      setTrackOffset(offset)
+
+      wheel.settleTimer = window.setTimeout(() => {
+        wheel.settleTimer = 0
+        const projectedOffset = -wheel.delta
+        wheel.delta = 0
+        const threshold = swipeThreshold()
+
+        if (projectedOffset <= -threshold && next) {
+          goTo(1)
+        } else if (projectedOffset >= threshold && prev) {
+          goTo(-1)
+        } else {
+          animateBack()
+        }
+      }, CAROUSEL_WHEEL_SETTLE_MS)
+    },
+    [animateBack, applyEdgeResistance, clearNavigationTimer, clearWheelTimer, goTo, next, prev, swipeThreshold, trackAnimating],
+  )
+
+  const handleCarouselClick = useCallback((event: ReactMouseEvent<HTMLDivElement>) => {
+    if (performance.now() < suppressClickUntilRef.current) {
+      event.preventDefault()
+      event.stopPropagation()
+      return
+    }
+    setChromeVisible((visible) => !visible)
+  }, [])
+
+  const trackStyle: CSSProperties = {
+    transform: `translate3d(calc(${-activeSlot * 100}% + ${trackOffset}px), 0, 0)`,
+    transition: trackAnimating ? `transform ${CAROUSEL_ANIMATION_MS}ms cubic-bezier(0.22, 1, 0.36, 1)` : "none",
+  }
+
+  useEffect(() => {
+    if (!node) return
+    function onKey(event: KeyboardEvent) {
+      if (event.key === "ArrowRight") goTo(1)
+      else if (event.key === "ArrowLeft") goTo(-1)
+    }
+    window.addEventListener("keydown", onKey)
+    return () => window.removeEventListener("keydown", onKey)
+  }, [node, goTo])
 
   return (
     <Dialog open={!!node} onOpenChange={onOpenChange}>
       <DialogContent
-        showCloseButton
-        className="h-svh w-screen max-w-none rounded-none border-0 bg-neutral-950 p-0 text-white shadow-none ring-0 sm:max-w-none"
+        showCloseButton={false}
+        animateContent={false}
+        className="h-svh max-h-svh w-screen max-w-none gap-0 overflow-hidden rounded-none border-0 bg-background p-0 text-foreground shadow-none ring-0 sm:max-w-none"
       >
         <DialogTitle className="sr-only">{node?.name ?? "Apercu"}</DialogTitle>
         {node && (
-          <div className="grid size-full place-items-center p-0">
-            {isImage ? (
-              <FullImageViewer token={token} node={node} src={source} />
-            ) : isVideo ? (
-              <ModernVideoPlayer
-                token={token}
-                node={node}
-                src={source}
-                name={node.name}
-              />
-            ) : (
-              <FileIcon className="size-16 text-neutral-500" />
+          <div ref={viewerSurfaceRef} className="relative size-full overflow-hidden">
+            <div
+              ref={carouselRef}
+              onPointerDown={handlePointerDown}
+              onPointerMove={handlePointerMove}
+              onPointerUp={handlePointerEnd}
+              onPointerCancel={handlePointerEnd}
+              onWheel={handleWheel}
+              onClick={handleCarouselClick}
+              className={cn(
+                "relative size-full touch-none select-none overflow-hidden [overflow-anchor:none]",
+                dragging ? "cursor-grabbing" : "cursor-grab",
+              )}
+            >
+              <div className="flex size-full will-change-transform" style={trackStyle}>
+                {slots.map((slotNode) => {
+                  const slotImage = slotNode.mime_type?.startsWith("image/")
+                  const slotVideo = slotNode.mime_type?.startsWith("video/")
+                  return (
+                    <div key={slotNode.id} className="h-full w-full shrink-0 overflow-hidden">
+                      {slotImage ? (
+                        slotNode.id === node.id ? (
+                          <FullImageViewer node={slotNode} src={mediaInlineUrl(slotNode)} />
+                        ) : (
+                          <MediaPreviewSlide node={slotNode} />
+                        )
+                      ) : slotVideo ? (
+                        slotNode.id === node.id ? (
+                          <ModernVideoPlayer
+                            node={slotNode}
+                            src={mediaInlineUrl(slotNode)}
+                            chromeVisible={chromeVisible}
+                            fullscreenTargetRef={viewerSurfaceRef}
+                            actions={{
+                              onDownload,
+                              onShare,
+                              onDelete,
+                              onClose: () => onOpenChange(false),
+                            }}
+                          />
+                        ) : (
+                          <MediaPreviewSlide node={slotNode} />
+                        )
+                      ) : slotNode.id === node.id ? (
+                        <div className="grid size-full place-items-center">
+                          <FileIcon className="size-16 text-muted-foreground" />
+                        </div>
+                      ) : (
+                        <MediaPreviewSlide node={slotNode} />
+                      )}
+                    </div>
+                  )
+                })}
+              </div>
+            </div>
+
+            <div className="pointer-events-none invisible absolute size-0 overflow-hidden">
+              {[prev, next]
+                .filter((candidate): candidate is NodeDto => !!candidate)
+                .map((candidate) => (
+                  <MediaPrefetch key={candidate.id} node={candidate} />
+                ))}
+            </div>
+
+            {prev && (
+              <button
+                type="button"
+                onClick={() => goTo(-1)}
+                className={cn(
+                  "absolute top-1/2 left-3 z-30 hidden size-11 -translate-y-1/2 place-items-center rounded-full bg-foreground/55 text-background transition-opacity hover:bg-foreground/75 sm:grid",
+                  chromeVisible ? "opacity-100" : "opacity-0",
+                )}
+              >
+                <ChevronLeft />
+                <span className="sr-only">Precedent</span>
+              </button>
             )}
+            {next && (
+              <button
+                type="button"
+                onClick={() => goTo(1)}
+                className={cn(
+                  "absolute top-1/2 right-3 z-30 hidden size-11 -translate-y-1/2 place-items-center rounded-full bg-foreground/55 text-background transition-opacity hover:bg-foreground/75 sm:grid",
+                  chromeVisible ? "opacity-100" : "opacity-0",
+                )}
+              >
+                <ChevronRight />
+                <span className="sr-only">Suivant</span>
+              </button>
+            )}
+
+            <AnimatePresence>
+              {chromeVisible && !activeIsVideo && (
+                <motion.div
+                  initial={{ opacity: 0, y: 16 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0, y: 16 }}
+                  transition={{ duration: 0.18 }}
+                  className="absolute inset-x-0 bottom-0 z-40 flex justify-center px-3 pt-8 pb-[calc(0.9rem+env(safe-area-inset-bottom))] sm:px-6"
+                >
+                  <div className="pointer-events-none absolute inset-x-0 -top-10 bottom-0 bg-gradient-to-t from-black/70 via-black/35 to-transparent" />
+                  <div className="relative flex w-full max-w-2xl items-center gap-2 rounded-[1.75rem] bg-foreground p-2 text-background shadow-lg">
+                    <Button
+                      size="icon"
+                      className="size-11 shrink-0 bg-accent text-accent-foreground hover:bg-accent/80"
+                      onClick={() => onDownload?.(node)}
+                    >
+                      <Download />
+                      <span className="sr-only">Telecharger</span>
+                    </Button>
+                    <Button
+                      className="h-11 flex-1 bg-secondary text-secondary-foreground hover:bg-secondary/80"
+                      onClick={() => onShare?.(node)}
+                    >
+                      <Share2 />
+                      Partager
+                    </Button>
+                    <Button
+                      className="h-11 flex-1 bg-destructive text-white hover:bg-destructive/90"
+                      onClick={() => onDelete?.(node)}
+                    >
+                      <Trash2 />
+                      Supprimer
+                    </Button>
+                    <Button
+                      size="icon"
+                      className="size-11 shrink-0 bg-muted text-foreground hover:bg-muted/70"
+                      onClick={() => onOpenChange(false)}
+                    >
+                      <X />
+                      <span className="sr-only">Fermer</span>
+                    </Button>
+                  </div>
+                </motion.div>
+              )}
+            </AnimatePresence>
           </div>
         )}
       </DialogContent>
@@ -3170,48 +3596,58 @@ function MediaViewer({
   )
 }
 
-function FullImageViewer({ token, node, src }: { token: string; node: NodeDto; src: string }) {
+const FULL_IMAGE_MAX_RETRIES = 3
+
+function FullImageViewer({ node, src }: { node: NodeDto; src: string }) {
   const [loaded, setLoaded] = useState(false)
   const [aspectRatio, setAspectRatio] = useState<number | null>(null)
+  const [attempt, setAttempt] = useState(0)
   const viewport = useViewportSize()
   const frameStyle = containedMediaFrameStyle(aspectRatio, viewport)
 
   useEffect(() => {
     setLoaded(false)
     setAspectRatio(null)
+    setAttempt(0)
   }, [src])
 
+  // Sur echec (reseau, requete annulee), on retente quelques fois avec cache-busting
+  // plutot que de laisser une image cassee -> le plein finit par charger.
+  const retrySrc = attempt === 0 ? src : `${src}${src.includes("?") ? "&" : "?"}retry=${attempt}`
+
   return (
-    <div className="relative grid size-full place-items-center overflow-hidden bg-neutral-950">
+    <div className="relative grid size-full place-items-center overflow-hidden bg-background">
       <div
         className="relative grid place-items-center overflow-hidden"
         style={frameStyle ?? fallbackMediaFrameStyle()}
       >
         <BlurredPreviewLayer
-          token={token}
           node={node}
           visible={!loaded}
           onAspectRatio={setAspectRatio}
         />
         {!loaded && (
-          <div className="absolute inset-0 z-10 grid place-items-center text-white">
-            <Loader2 className="size-8 animate-spin drop-shadow-lg" />
+          <div className="absolute inset-0 z-10 grid place-items-center text-primary">
+            <Loader2 className="size-8 animate-spin" />
           </div>
         )}
         <img
-          src={src}
+          src={retrySrc}
           alt={node.name}
           draggable={false}
-          className={cn(
-            "relative z-20 size-full object-contain transition-opacity duration-300",
-            loaded ? "opacity-100" : "opacity-0",
-          )}
+          className={cn("relative z-20 size-full object-contain", loaded ? "opacity-100" : "opacity-0")}
           onLoad={(event) => {
             const ratio = imageAspectRatio(event.currentTarget)
             if (ratio) setAspectRatio(ratio)
             setLoaded(true)
           }}
-          onError={() => setLoaded(true)}
+          onError={() => {
+            if (attempt < FULL_IMAGE_MAX_RETRIES) {
+              window.setTimeout(() => setAttempt((value) => value + 1), 600)
+            } else {
+              setLoaded(true)
+            }
+          }}
         />
       </div>
     </div>
@@ -3219,12 +3655,10 @@ function FullImageViewer({ token, node, src }: { token: string; node: NodeDto; s
 }
 
 function BlurredPreviewLayer({
-  token,
   node,
   visible,
   onAspectRatio,
 }: {
-  token: string
   node: NodeDto
   visible: boolean
   onAspectRatio?: (aspectRatio: number) => void
@@ -3234,12 +3668,11 @@ function BlurredPreviewLayer({
   return (
     <div
       className={cn(
-        "pointer-events-none absolute inset-0 z-0 overflow-hidden bg-neutral-950 transition-opacity duration-300",
+        "pointer-events-none absolute inset-0 z-0 overflow-hidden bg-muted transition-opacity duration-300",
         visible ? "opacity-100" : "opacity-0",
       )}
     >
       <ProtectedPreview
-        token={token}
         src={node.preview_url}
         showFallback={false}
         className="scale-105 blur-2xl brightness-75 saturate-125"
@@ -3248,12 +3681,24 @@ function BlurredPreviewLayer({
           if (ratio) onAspectRatio?.(ratio)
         }}
       />
-      <div className="absolute inset-0 bg-neutral-950/20" />
+      <div className="absolute inset-0 bg-background/30" />
     </div>
   )
 }
 
-function ModernVideoPlayer({ token, node, src, name }: { token: string; node: NodeDto; src: string; name: string }) {
+function ModernVideoPlayer({
+  node,
+  src,
+  chromeVisible,
+  fullscreenTargetRef,
+  actions,
+}: {
+  node: NodeDto
+  src: string
+  chromeVisible: boolean
+  fullscreenTargetRef?: FullscreenTargetRef
+  actions?: MediaActionHandlers
+}) {
   const videoRef = useRef<HTMLVideoElement | null>(null)
   const containerRef = useRef<HTMLDivElement | null>(null)
   const [playing, setPlaying] = useState(false)
@@ -3262,20 +3707,16 @@ function ModernVideoPlayer({ token, node, src, name }: { token: string; node: No
   const [duration, setDuration] = useState(0)
   const [currentTime, setCurrentTime] = useState(0)
   const [buffered, setBuffered] = useState(0)
-  const [volume, setVolume] = useState(1)
-  const [muted, setMuted] = useState(false)
-  const [controlsVisible, setControlsVisible] = useState(true)
-  const [fullscreen, setFullscreen] = useState(false)
-  const [rotated, setRotated] = useState(false)
   const [videoSize, setVideoSize] = useState({ width: 0, height: 0 })
   const [previewAspectRatio, setPreviewAspectRatio] = useState<number | null>(null)
+  const [fullscreen, setFullscreen] = useState(false)
   const viewport = useViewportSize()
 
   const progress = duration > 0 ? (currentTime / duration) * 100 : 0
   const bufferedProgress = duration > 0 ? (buffered / duration) * 100 : 0
-  const isLandscape = videoSize.width > videoSize.height
   const videoAspectRatio = videoSize.width > 0 && videoSize.height > 0 ? videoSize.width / videoSize.height : previewAspectRatio
-  const frameStyle = rotated ? undefined : containedMediaFrameStyle(videoAspectRatio, viewport)
+  const frameStyle = containedMediaFrameStyle(videoAspectRatio, viewport)
+  const showActionRow = !!actions && !fullscreen
 
   useEffect(() => {
     setPlaying(false)
@@ -3284,39 +3725,15 @@ function ModernVideoPlayer({ token, node, src, name }: { token: string; node: No
     setDuration(0)
     setCurrentTime(0)
     setBuffered(0)
-    setControlsVisible(true)
-    setRotated(false)
     setVideoSize({ width: 0, height: 0 })
     setPreviewAspectRatio(null)
   }, [src])
 
-  useEffect(() => {
-    const onFullscreenChange = () => {
-      setFullscreen(document.fullscreenElement === containerRef.current)
-    }
-    document.addEventListener("fullscreenchange", onFullscreenChange)
-    return () => document.removeEventListener("fullscreenchange", onFullscreenChange)
-  }, [])
-
-  useEffect(() => {
-    if (!playing || waiting || controlsVisible === false) return
-    const timer = window.setTimeout(() => setControlsVisible(false), 2400)
-    return () => window.clearTimeout(timer)
-  }, [controlsVisible, playing, waiting])
-
-  function showControls() {
-    setControlsVisible(true)
-  }
-
-  async function togglePlay() {
+  function togglePlay() {
     const video = videoRef.current
     if (!video) return
-    showControls()
-    if (video.paused) {
-      await video.play().catch(() => undefined)
-    } else {
-      video.pause()
-    }
+    if (video.paused) void video.play().catch(() => undefined)
+    else video.pause()
   }
 
   function updateBuffered() {
@@ -3330,82 +3747,66 @@ function ModernVideoPlayer({ token, node, src, name }: { token: string; node: No
     if (!video) return
     video.currentTime = value
     setCurrentTime(value)
-    showControls()
   }
 
-  function changeVolume(value: number) {
-    const video = videoRef.current
-    if (!video) return
-    video.volume = value
-    video.muted = value === 0
-    setVolume(value)
-    setMuted(video.muted)
-    showControls()
-  }
-
-  function toggleMute() {
-    const video = videoRef.current
-    if (!video) return
-    video.muted = !video.muted
-    setMuted(video.muted)
-    showControls()
-  }
+  useEffect(() => {
+    const onChange = () => {
+      const fullscreenTarget = fullscreenTargetRef?.current ?? containerRef.current
+      setFullscreen(document.fullscreenElement === fullscreenTarget)
+    }
+    document.addEventListener("fullscreenchange", onChange)
+    return () => document.removeEventListener("fullscreenchange", onChange)
+  }, [fullscreenTargetRef])
 
   async function toggleFullscreen() {
-    const container = containerRef.current
-    if (!container) return
-    showControls()
+    const fullscreenTarget = fullscreenTargetRef?.current ?? containerRef.current
+    if (!fullscreenTarget) return
+    // L'API de verrouillage d'orientation n'est pas typee partout : acces souple.
+    const orientation = screen.orientation as
+      | (ScreenOrientation & { lock?: (orientation: string) => Promise<void>; unlock?: () => void })
+      | undefined
     if (document.fullscreenElement) {
+      try {
+        orientation?.unlock?.()
+      } catch {
+        // l'orientation ne peut pas toujours etre deverrouillee
+      }
       await document.exitFullscreen().catch(() => undefined)
-    } else {
-      await container.requestFullscreen?.().catch(() => undefined)
+      return
     }
-  }
-
-  function toggleRotation() {
-    setRotated((current) => !current)
-    showControls()
+    await fullscreenTarget.requestFullscreen?.().catch(() => undefined)
+    // Pour une video horizontale on tente de basculer l'ecran en paysage (mobile).
+    if (videoSize.width > videoSize.height) {
+      try {
+        await orientation?.lock?.("landscape")?.catch(() => undefined)
+      } catch {
+        // verrouillage d'orientation non supporte
+      }
+    }
   }
 
   return (
     <div
       ref={containerRef}
-      className="group relative grid size-full place-items-center overflow-hidden bg-neutral-950"
-      onPointerMove={showControls}
-      onPointerDown={showControls}
+      className="relative grid size-full place-items-center overflow-hidden bg-background"
     >
       <div
-        className={cn(
-          "relative grid place-items-center overflow-hidden",
-          rotated && "size-full",
-        )}
-        style={rotated ? undefined : frameStyle ?? fallbackMediaFrameStyle()}
+        className="relative grid place-items-center overflow-hidden"
+        style={frameStyle ?? fallbackMediaFrameStyle()}
       >
-        <BlurredPreviewLayer
-          token={token}
-          node={node}
-          visible={!mediaReady}
-          onAspectRatio={setPreviewAspectRatio}
-        />
+        <BlurredPreviewLayer node={node} visible={!mediaReady} onAspectRatio={setPreviewAspectRatio} />
         <video
           ref={videoRef}
           src={src}
           className={cn(
-            "relative z-10 object-contain transition-[opacity,transform] duration-200",
+            "relative z-10 size-full object-contain transition-opacity duration-200",
             mediaReady ? "opacity-100" : "opacity-0",
-            rotated
-              ? "h-[100vw] max-h-none w-[100svh] max-w-none rotate-90"
-              : "size-full",
           )}
           autoPlay
           playsInline
           preload="metadata"
-          onClick={togglePlay}
-          onDoubleClick={toggleFullscreen}
           onLoadedMetadata={(event) => {
             setDuration(event.currentTarget.duration || 0)
-            setVolume(event.currentTarget.volume)
-            setMuted(event.currentTarget.muted)
             setVideoSize({
               width: event.currentTarget.videoWidth,
               height: event.currentTarget.videoHeight,
@@ -3424,116 +3825,120 @@ function ModernVideoPlayer({ token, node, src, name }: { token: string; node: No
             setPlaying(true)
             setWaiting(false)
           }}
-          onPause={() => {
-            setPlaying(false)
-            setControlsVisible(true)
-          }}
-          onEnded={() => {
-            setPlaying(false)
-            setControlsVisible(true)
-          }}
+          onPause={() => setPlaying(false)}
+          onEnded={() => setPlaying(false)}
         />
       </div>
 
-      {(waiting || !playing) && (
-        <button
-          type="button"
-          className="absolute inset-0 z-20 grid place-items-center text-white"
-          onClick={togglePlay}
-        >
-          <span className="grid size-16 place-items-center rounded-full bg-black/55 shadow-2xl backdrop-blur-md">
-            {waiting ? <Loader2 className="size-7 animate-spin" /> : <Play className="ml-1 size-8 fill-current" />}
+      {waiting && (
+        <div className="pointer-events-none absolute inset-0 z-20 grid place-items-center text-background">
+          <span className="grid size-14 place-items-center rounded-full bg-foreground/60">
+            <Loader2 className="size-7 animate-spin" />
           </span>
-          <span className="sr-only">{playing ? "Pause" : "Lecture"}</span>
-        </button>
+        </div>
       )}
 
-      <div
-        className={cn(
-          "pointer-events-none absolute inset-x-0 bottom-0 z-30 grid gap-3 bg-linear-to-t from-black/85 via-black/45 to-transparent px-3 pt-16 pb-[calc(0.75rem+env(safe-area-inset-bottom))] text-white transition-opacity sm:px-5 sm:pb-5",
-          controlsVisible || !playing ? "opacity-100" : "opacity-0",
-        )}
-      >
-        <div className="pointer-events-auto grid gap-3">
-          <div className="relative h-5">
-            <div className="absolute top-1/2 right-0 left-0 h-1 -translate-y-1/2 rounded-full bg-white/20">
-              <div className="h-full rounded-full bg-white/35" style={{ width: `${bufferedProgress}%` }} />
-              <div className="absolute top-0 left-0 h-full rounded-full bg-primary" style={{ width: `${progress}%` }} />
-            </div>
-            <input
-              aria-label="Progression video"
-              className="video-range absolute inset-0"
-              type="range"
-              min={0}
-              max={duration || 0}
-              step={0.05}
-              value={Math.min(currentTime, duration || currentTime)}
-              onChange={(event) => seek(Number(event.target.value))}
-            />
-          </div>
-
-          <div className="flex items-center gap-2">
-            <Button variant="ghost" size="icon" className="size-11 text-white hover:bg-white/15 hover:text-white" onClick={togglePlay}>
-              {playing ? <Pause className="fill-current" /> : <Play className="ml-0.5 fill-current" />}
-              <span className="sr-only">{playing ? "Pause" : "Lecture"}</span>
-            </Button>
-
-            <div className="flex items-center gap-2">
-              <Button variant="ghost" size="icon-sm" className="text-white hover:bg-white/15 hover:text-white" onClick={toggleMute}>
-                {muted || volume === 0 ? <VolumeX /> : <Volume2 />}
-                <span className="sr-only">Son</span>
-              </Button>
-              <input
-                aria-label="Volume"
-                className="video-range hidden w-20 sm:block"
-                type="range"
-                min={0}
-                max={1}
-                step={0.05}
-                value={muted ? 0 : volume}
-                onChange={(event) => changeVolume(Number(event.target.value))}
-              />
-            </div>
-
-            <span className="min-w-28 text-xs font-medium tabular-nums text-white/85">
-              {formatDuration(currentTime)} / {formatDuration(duration)}
-            </span>
-
-            <div className="min-w-0 flex-1" />
-
-            <span className="hidden max-w-[32vw] truncate text-xs text-white/65 sm:block">{name}</span>
-            {isLandscape && (
-              <Button
-                variant="ghost"
-                size="icon"
-                className={cn(
-                  "size-11 text-white hover:bg-white/15 hover:text-white",
-                  rotated && "bg-white/15",
-                )}
-                onClick={toggleRotation}
-              >
-                <RotateCw />
-                <span className="sr-only">Tourner la video</span>
-              </Button>
+      <AnimatePresence>
+        {chromeVisible && (
+          <motion.div
+            initial={{ opacity: 0, y: 12 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: 12 }}
+            transition={{ duration: 0.18 }}
+            onClick={(event) => event.stopPropagation()}
+            onPointerDown={(event) => event.stopPropagation()}
+            className={cn(
+              "absolute inset-x-0 z-40 flex touch-none justify-center px-3 sm:px-6",
+              showActionRow ? "bottom-0 pb-[calc(0.9rem+env(safe-area-inset-bottom))]" : "bottom-0 pb-[calc(0.35rem+env(safe-area-inset-bottom))]",
             )}
-            <Button
-              variant="ghost"
-              size="icon"
-              className="size-11 text-white hover:bg-white/15 hover:text-white"
-              onClick={toggleFullscreen}
+          >
+            <div className="pointer-events-none absolute inset-x-0 -top-16 bottom-0 bg-gradient-to-t from-black/70 via-black/35 to-transparent" />
+            <div
+              className={cn(
+                "relative w-full max-w-2xl bg-foreground text-background shadow-lg",
+                showActionRow ? "grid gap-2 rounded-[1.75rem] p-2" : "flex max-w-5xl items-center gap-3 rounded-full px-2.5 py-2",
+              )}
             >
-              {fullscreen ? <Minimize2 /> : <Maximize2 />}
-              <span className="sr-only">Plein ecran</span>
-            </Button>
-          </div>
-        </div>
-      </div>
+              <div className={cn("flex w-full items-center gap-3", showActionRow && "px-0.5")}>
+                <button
+                  type="button"
+                  onClick={togglePlay}
+                  className="grid size-10 shrink-0 place-items-center rounded-full text-background transition-colors hover:bg-background/20"
+                >
+                  {playing ? <Pause className="size-5 fill-current" /> : <Play className="ml-0.5 size-5 fill-current" />}
+                  <span className="sr-only">{playing ? "Pause" : "Lecture"}</span>
+                </button>
+                <div className="relative h-5 flex-1">
+                  <div className="absolute top-1/2 right-0 left-0 h-1.5 -translate-y-1/2 rounded-full bg-background/25">
+                    <div className="h-full rounded-full bg-background/45" style={{ width: `${bufferedProgress}%` }} />
+                    <div className="absolute top-0 left-0 h-full rounded-full bg-primary" style={{ width: `${progress}%` }} />
+                  </div>
+                  <input
+                    aria-label="Progression video"
+                    className="video-range absolute inset-0"
+                    type="range"
+                    min={0}
+                    max={duration || 0}
+                    step={0.05}
+                    value={Math.min(currentTime, duration || currentTime)}
+                    onChange={(event) => seek(Number(event.target.value))}
+                  />
+                </div>
+                <span className="shrink-0 text-xs font-medium tabular-nums text-background/85">
+                  {formatDuration(currentTime)} / {formatDuration(duration)}
+                </span>
+                <button
+                  type="button"
+                  onClick={toggleFullscreen}
+                  className="grid size-9 shrink-0 place-items-center rounded-full text-background transition-colors hover:bg-background/20"
+                >
+                  {fullscreen ? <Minimize2 className="size-5" /> : <Maximize2 className="size-5" />}
+                  <span className="sr-only">Plein ecran</span>
+                </button>
+              </div>
+              {showActionRow && (
+                <div className="flex items-center gap-2">
+                  <Button
+                    size="icon"
+                    className="size-11 shrink-0 bg-accent text-accent-foreground hover:bg-accent/80"
+                    onClick={() => actions.onDownload?.(node)}
+                  >
+                    <Download />
+                    <span className="sr-only">Telecharger</span>
+                  </Button>
+                  <Button
+                    className="h-11 flex-1 bg-secondary text-secondary-foreground hover:bg-secondary/80"
+                    onClick={() => actions.onShare?.(node)}
+                  >
+                    <Share2 />
+                    Partager
+                  </Button>
+                  <Button
+                    className="h-11 flex-1 bg-destructive text-white hover:bg-destructive/90"
+                    onClick={() => actions.onDelete?.(node)}
+                  >
+                    <Trash2 />
+                    Supprimer
+                  </Button>
+                  <Button
+                    size="icon"
+                    className="size-11 shrink-0 bg-muted text-foreground hover:bg-muted/70"
+                    onClick={actions.onClose}
+                  >
+                    <X />
+                    <span className="sr-only">Fermer</span>
+                  </Button>
+                </div>
+              )}
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </div>
   )
 }
 
 function DetailsDialog({
-  token,
   node,
   showPath = false,
   onOpenChange,
@@ -3543,7 +3948,6 @@ function DetailsDialog({
   onDelete,
   onOpenParent,
 }: {
-  token: string
   node: NodeDto | null
   showPath?: boolean
   onOpenChange: (open: boolean) => void
@@ -3562,9 +3966,9 @@ function DetailsDialog({
       <DialogContent className="max-h-[92svh] w-[calc(100vw-1.5rem)] overflow-hidden p-0 sm:max-w-3xl">
         {node && (
           <div className="grid max-h-[92svh] overflow-y-auto">
-            <div className="grid aspect-square max-h-[62svh] place-items-center bg-neutral-950 text-neutral-400 sm:aspect-video">
+            <div className="grid aspect-square max-h-[62svh] place-items-center bg-muted text-muted-foreground sm:aspect-video">
               {node.preview_url ? (
-                <ProtectedPreview token={token} src={node.preview_url} fit="contain" />
+                <ProtectedPreview src={node.preview_url} fit="contain" />
               ) : isFolder ? (
                 <Folder className="size-16 text-primary" />
               ) : isVideo ? (
@@ -3591,7 +3995,7 @@ function DetailsDialog({
                 )}
               </DialogHeader>
 
-              <div className="grid gap-2 rounded-lg border p-3 text-sm">
+              <div className="grid gap-2 rounded-2xl border border-border bg-muted p-3 text-sm">
                 <DetailRow label="Taille" value={isFolder ? "Dossier" : formatBytes(node.size_bytes ?? 0)} />
                 <DetailRow label="Date fichier" value={formatShortDate(node.display_date_at)} />
                 <DetailRow label="Ajoute" value={formatShortDate(node.created_at)} />
@@ -3644,12 +4048,10 @@ function DetailRow({ label, value }: { label: string; value: string }) {
 }
 
 function ShareDialog({
-  token,
   node,
   request,
   onOpenChange,
 }: {
-  token: string
   node: NodeDto | null
   request: <T>(path: string, init?: RequestInit) => Promise<T>
   onOpenChange: (open: boolean) => void
@@ -3657,6 +4059,7 @@ function ShareDialog({
   const [shares, setShares] = useState<ShareDto[]>([])
   const [newLink, setNewLink] = useState("")
   const [copied, setCopied] = useState(false)
+  const now = Math.floor(Date.now() / 1000)
 
   const load = useCallback(async () => {
     if (!node) return
@@ -3733,14 +4136,15 @@ function ShareDialog({
               <p className="text-sm text-muted-foreground">Aucun lien actif pour le moment.</p>
             ) : (
               shares.map((share) => (
-                <div key={share.id} className="flex items-center justify-between gap-3 rounded-xl border p-3">
+                <div key={share.id} className="flex items-center justify-between gap-3 rounded-2xl border border-border bg-muted p-3">
                   <div className="grid gap-1.5">
-                    <Badge variant={share.revoked_at ? "secondary" : "default"}>
-                      {share.revoked_at ? "Revoque" : "Actif"}
+                    <Badge variant={share.revoked_at || share.expires_at <= now ? "secondary" : "default"}>
+                      {share.revoked_at ? "Revoque" : share.expires_at <= now ? "Expire" : "Actif"}
                     </Badge>
+                    <span className="text-xs text-muted-foreground">Expire le {formatDateTime(share.expires_at)}</span>
                     <span className="text-xs text-muted-foreground">{share.download_count} telechargement(s)</span>
                   </div>
-                  {!share.revoked_at && (
+                  {!share.revoked_at && share.expires_at > now && (
                     <Button variant="destructive" size="sm" onClick={() => void revoke(share.id)}>
                       Revoquer
                     </Button>
@@ -3835,7 +4239,7 @@ function BatchShareDialog({
               <Separator />
               <div className="grid max-h-[45svh] gap-2 overflow-y-auto pr-1">
                 {links.map((link) => (
-                  <div key={link.fileId} className="grid gap-2 rounded-xl border p-3">
+                  <div key={link.fileId} className="grid gap-2 rounded-2xl border border-border bg-muted p-3">
                     <p className="line-clamp-2 break-all text-sm font-medium">{link.name}</p>
                     <div className="grid grid-cols-[1fr_auto] gap-2">
                       <Input readOnly className="h-10 min-w-0" value={link.url} />
@@ -3900,7 +4304,7 @@ function SharePage({ shareToken }: { shareToken: string }) {
             )}
             {file && (
               <>
-                <div className="grid aspect-video place-items-center overflow-hidden rounded-xl bg-muted text-muted-foreground">
+                <div className="grid aspect-video place-items-center overflow-hidden rounded-2xl border border-border bg-muted text-muted-foreground">
                   {file.preview_url ? (
                     <img src={file.preview_url} alt="" draggable={false} className="size-full object-cover" />
                   ) : (
@@ -3967,7 +4371,7 @@ function UploadToastView({
   state: "active" | "done" | "error"
 }) {
   return (
-    <div className="grid w-[min(92vw,360px)] max-w-[92vw] gap-2 overflow-hidden rounded-xl border bg-popover p-4 text-popover-foreground shadow-lg">
+    <div className="grid w-[min(92vw,360px)] max-w-[92vw] gap-2 overflow-hidden rounded-2xl border border-border bg-popover p-4 text-popover-foreground shadow-lg">
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0 flex-1 overflow-hidden">
           <p className="line-clamp-2 max-w-full break-all text-sm font-medium leading-snug">{name}</p>
@@ -4005,38 +4409,11 @@ function isVideoFile(file: File) {
   return type.startsWith("video/") || videoExtension(file.name)
 }
 
-function isVideoNode(node: NodeDto) {
-  return node.kind === "file" && !!node.mime_type?.startsWith("video/")
-}
-
-function shouldGenerateStoredVideoPreview(node: NodeDto) {
-  return isVideoNode(node) && !node.preview_url
-}
-
 function shouldUseLightImport(files: File[]) {
   if (files.length > LIGHT_IMPORT_FILE_LIMIT) return true
   const totalBytes = files.reduce((total, file) => total + file.size, 0)
   if (totalBytes > LIGHT_IMPORT_BYTES_LIMIT) return true
   return isConstrainedMobileBrowser() && files.length > 8
-}
-
-function uploadConcurrencyFor(files: File[], lightImport: boolean) {
-  if (files.length <= 1) return 1
-  if (isConstrainedMobileBrowser()) return Math.min(MOBILE_UPLOAD_CONCURRENCY, files.length)
-
-  const hasHugeFile = files.some((file) => file.size > 512 * 1024 * 1024)
-  const concurrency = hasHugeFile || lightImport ? 3 : DESKTOP_UPLOAD_CONCURRENCY
-  return Math.min(concurrency, files.length)
-}
-
-function shouldQueueClientPreview(file: File, lightImport: boolean) {
-  if (!isPreviewCandidate(file)) return false
-  if (isVideoFile(file)) return false
-  if (isConstrainedMobileBrowser()) {
-    if (file.size > 24 * 1024 * 1024) return false
-    if (lightImport && file.size > 12 * 1024 * 1024) return false
-  }
-  return true
 }
 
 function isConstrainedMobileBrowser() {
@@ -4193,9 +4570,56 @@ async function ensureFolderPath(
   return parentId
 }
 
+function uploadWindowBytes(file: File) {
+  return Math.max(1, Number.isFinite(file.size) ? file.size : 1)
+}
+
+function runUploadsWithinByteWindow(
+  fileCount: number,
+  getBytes: (fileIndex: number) => number,
+  runFile: (fileIndex: number) => Promise<void>,
+) {
+  return new Promise<void>((resolve) => {
+    let activeBytes = 0
+    let activeUploads = 0
+    let nextIndex = 0
+    let resolved = false
+
+    const resolveIfDone = () => {
+      if (resolved || activeUploads > 0 || nextIndex < fileCount) return
+      resolved = true
+      resolve()
+    }
+
+    const schedule = () => {
+      while (nextIndex < fileCount) {
+        const cost = Math.max(1, getBytes(nextIndex))
+        if (activeUploads > 0 && activeBytes + cost > MAX_ACTIVE_UPLOAD_BYTES) break
+
+        const fileIndex = nextIndex
+        nextIndex += 1
+        activeUploads += 1
+        activeBytes += cost
+
+        void runFile(fileIndex)
+          .catch(() => undefined)
+          .finally(() => {
+            activeBytes = Math.max(0, activeBytes - cost)
+            activeUploads -= 1
+            schedule()
+            resolveIfDone()
+          })
+      }
+
+      resolveIfDone()
+    }
+
+    schedule()
+  })
+}
+
 async function uploadFileWithConflictHandling({
   request,
-  token,
   clientId,
   folderId,
   file,
@@ -4203,7 +4627,6 @@ async function uploadFileWithConflictHandling({
   getDuplicateDecision,
 }: {
   request: <T>(path: string, init?: RequestInit) => Promise<T>
-  token: string
   clientId: string
   folderId: string
   file: File
@@ -4214,7 +4637,7 @@ async function uploadFileWithConflictHandling({
 
   for (;;) {
     try {
-      return await uploadRawFile(token, clientId, folderId, file, onProgress, uploadName)
+      return await uploadRawFile(clientId, folderId, file, onProgress, uploadName)
     } catch (err) {
       if (!isConflictError(err)) throw err
 
@@ -4234,7 +4657,7 @@ async function uploadFileWithConflictHandling({
         throw new Error("Un dossier porte deja ce nom.")
       }
 
-      return await replaceRawFile(token, clientId, existing.id, file, onProgress)
+      return await replaceRawFile(clientId, existing.id, file, onProgress)
     }
   }
 }
@@ -4286,7 +4709,6 @@ function isConflictError(err: unknown) {
 }
 
 function uploadRawFile(
-  token: string,
   clientId: string,
   folderId: string,
   file: File,
@@ -4300,7 +4722,6 @@ function uploadRawFile(
       file_date_at: String(Math.max(1, Math.floor(file.lastModified / 1000))),
     })
     xhr.open("POST", `/api/folders/${folderId}/files?${params}`)
-    xhr.setRequestHeader("Authorization", `Bearer ${token}`)
     xhr.setRequestHeader("X-NAS-Client-ID", clientId)
     if (file.type) xhr.setRequestHeader("Content-Type", file.type)
     xhr.upload.onprogress = (event) => {
@@ -4321,7 +4742,6 @@ function uploadRawFile(
 }
 
 function replaceRawFile(
-  token: string,
   clientId: string,
   fileId: string,
   file: File,
@@ -4333,7 +4753,6 @@ function replaceRawFile(
       file_date_at: String(Math.max(1, Math.floor(file.lastModified / 1000))),
     })
     xhr.open("PUT", `/api/files/${fileId}?${params}`)
-    xhr.setRequestHeader("Authorization", `Bearer ${token}`)
     xhr.setRequestHeader("X-NAS-Client-ID", clientId)
     if (file.type) xhr.setRequestHeader("Content-Type", file.type)
     xhr.upload.onprogress = (event) => {
@@ -4362,25 +4781,31 @@ function parseUploadError(value: string) {
   }
 }
 
-async function uploadClientPreview(token: string, clientId: string, fileId: string, file: File) {
-  const preview = await createThumbnail(file)
-  if (!preview) return null
-
-  return uploadPreviewBlob(token, clientId, fileId, preview)
+function createPreviewForUpload(file: File) {
+  if (!isPreviewCandidate(file)) return Promise.resolve(null)
+  return createThumbnail(file)
 }
 
-async function uploadStoredVideoPreview(token: string, clientId: string, node: NodeDto) {
-  const preview = await createVideoThumbnailFromSource(mediaInlineUrl(token, node))
-  if (!preview) return null
+async function uploadPreparedPreview(
+  clientId: string,
+  fileId: string,
+  previewPromise: Promise<Blob | null>,
+  onPreviewed: (node: NodeDto) => void,
+) {
+  try {
+    const preview = await previewPromise
+    if (!preview) return
 
-  return uploadPreviewBlob(token, clientId, node.id, preview)
+    onPreviewed(await uploadPreviewBlob(clientId, fileId, preview))
+  } catch {
+    // Preview generation/upload is intentionally silent.
+  }
 }
 
-async function uploadPreviewBlob(token: string, clientId: string, fileId: string, preview: Blob) {
+async function uploadPreviewBlob(clientId: string, fileId: string, preview: Blob) {
   const response = await fetch(`/api/files/${fileId}/preview`, {
     method: "PUT",
     headers: {
-      Authorization: `Bearer ${token}`,
       "X-NAS-Client-ID": clientId,
       "Content-Type": preview.type,
     },
@@ -4553,14 +4978,12 @@ function videoExtension(name: string) {
   return ["m4v", "mkv", "mov", "mp4", "webm"].includes(name.split(".").pop()?.toLowerCase() ?? "")
 }
 
-async function downloadProtectedFile(token: string, node: NodeDto) {
+async function downloadProtectedFile(node: NodeDto) {
   if (!node.download_url) return
 
   const loadingId = toast.loading("Preparation du telechargement", { description: node.name })
   try {
-    const response = await fetch(node.download_url, {
-      headers: { Authorization: `Bearer ${token}` },
-    })
+    const response = await fetch(node.download_url)
     if (!response.ok) throw new Error(await readError(response))
 
     const blob = await response.blob()
@@ -4625,6 +5048,20 @@ function groupNodesBySort(nodes: NodeDto[], sortMode: SortMode): NodeGroup[] {
   }
 
   return Array.from(years.values())
+}
+
+/** Aplatit les groupes dans l'ordre exact d'affichage de la grille (annee > mois, ou "Tous"),
+ * pour que la navigation du carrousel suive l'ordre visible et pas l'ordre brut des donnees. */
+function flattenGroupNodes(groups: NodeGroup[]): NodeDto[] {
+  const out: NodeDto[] = []
+  for (const group of groups) {
+    if (group.children) {
+      for (const child of group.children) out.push(...child.nodes)
+    } else {
+      out.push(...group.nodes)
+    }
+  }
+  return out
 }
 
 function upsertNode(nodes: NodeDto[], node: NodeDto) {
@@ -4744,6 +5181,16 @@ function formatShortDate(timestamp: number) {
   }).format(new Date(timestamp * 1000))
 }
 
+function formatDateTime(timestamp: number) {
+  return new Intl.DateTimeFormat("fr-FR", {
+    day: "2-digit",
+    month: "short",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(new Date(timestamp * 1000))
+}
+
 function formatDuration(seconds: number) {
   if (!Number.isFinite(seconds) || seconds <= 0) return "0:00"
   const total = Math.floor(seconds)
@@ -4856,8 +5303,8 @@ function toAbsoluteUrl(value: string) {
   return `${window.location.origin}${value}`
 }
 
-function mediaInlineUrl(token: string, node: NodeDto) {
-  return `/api/files/${node.id}/inline?access_token=${encodeURIComponent(token)}`
+function mediaInlineUrl(node: NodeDto) {
+  return `/api/files/${node.id}/inline`
 }
 
 createRoot(document.getElementById("root")!).render(

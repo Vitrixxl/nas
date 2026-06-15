@@ -8,9 +8,10 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
     http::{
-        HeaderMap, StatusCode,
+        HeaderMap, HeaderValue, StatusCode,
         header::{
             ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, RANGE,
+            SET_COOKIE,
         },
     },
     middleware,
@@ -33,6 +34,8 @@ use crate::{
     realtime::RealtimeEvent,
     storage,
 };
+
+const SHARE_TTL_SECONDS: i64 = 60 * 60;
 
 pub fn build_router(state: AppState) -> Router {
     let protected = Router::new()
@@ -96,7 +99,6 @@ struct LoginRequest {
 
 #[derive(Serialize)]
 struct LoginResponse {
-    token: String,
     expires_at: i64,
 }
 
@@ -105,7 +107,7 @@ async fn login(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(payload): Json<LoginRequest>,
-) -> AppResult<Json<LoginResponse>> {
+) -> AppResult<Response> {
     let connect_info = ConnectInfo(addr);
     let key = auth::client_rate_key(&headers, &connect_info, state.config.trust_proxy_headers);
     if !state.login_limiter.check_and_record(&key) {
@@ -135,18 +137,34 @@ async fn login(
     .execute(&state.db)
     .await?;
 
-    Ok(Json(LoginResponse { token, expires_at }))
+    let mut response = Json(LoginResponse { expires_at }).into_response();
+    append_set_cookie(
+        &mut response,
+        auth::session_cookie(
+            &token,
+            state.config.session_ttl_seconds,
+            request_uses_https(&state, &headers),
+        ),
+    )?;
+    Ok(response)
 }
 
 async fn logout(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Extension(session): Extension<auth::AuthenticatedSession>,
-) -> AppResult<StatusCode> {
+) -> AppResult<Response> {
     sqlx::query("DELETE FROM sessions WHERE id = ?1")
         .bind(session.id)
         .execute(&state.db)
         .await?;
-    Ok(StatusCode::NO_CONTENT)
+
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    append_set_cookie(
+        &mut response,
+        auth::expired_session_cookie(request_uses_https(&state, &headers)),
+    )?;
+    Ok(response)
 }
 
 #[derive(Serialize)]
@@ -158,6 +176,28 @@ async fn me(Extension(session): Extension<auth::AuthenticatedSession>) -> Json<M
     Json(MeResponse {
         expires_at: session.expires_at,
     })
+}
+
+fn append_set_cookie(response: &mut Response, cookie: String) -> AppResult<()> {
+    let value = HeaderValue::from_str(&cookie)
+        .map_err(|error| AppError::Internal(anyhow::anyhow!("invalid session cookie: {error}")))?;
+    response.headers_mut().append(SET_COOKIE, value);
+    Ok(())
+}
+
+fn request_uses_https(state: &AppState, headers: &HeaderMap) -> bool {
+    state
+        .config
+        .public_base_url
+        .as_deref()
+        .is_some_and(|base_url| base_url.starts_with("https://"))
+        || (state.config.trust_proxy_headers
+            && headers
+                .get("x-forwarded-proto")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.split(',').next())
+                .map(str::trim)
+                .is_some_and(|value| value.eq_ignore_ascii_case("https")))
 }
 
 #[derive(Deserialize)]
@@ -250,9 +290,33 @@ struct SearchResponse {
     nodes: Vec<NodeDto>,
 }
 
+/// Clause SQL de filtre par type de media (image/video), appliquee cote serveur.
+/// `keep_folders` conserve les dossiers dans la liste (pour la navigation).
+fn media_filter_clause(media: Option<&str>, keep_folders: bool) -> AppResult<&'static str> {
+    Ok(match media {
+        Some("image") => {
+            if keep_folders {
+                " AND (kind = 'folder' OR mime_type LIKE 'image/%')"
+            } else {
+                " AND mime_type LIKE 'image/%'"
+            }
+        }
+        Some("video") => {
+            if keep_folders {
+                " AND (kind = 'folder' OR mime_type LIKE 'video/%')"
+            } else {
+                " AND mime_type LIKE 'video/%'"
+            }
+        }
+        None | Some("all") | Some("") => "",
+        Some(_) => return Err(AppError::BadRequest("unsupported media filter".into())),
+    })
+}
+
 #[derive(Default, Deserialize)]
 struct FolderQuery {
     sort: Option<String>,
+    media: Option<String>,
 }
 
 async fn get_folder(
@@ -279,11 +343,15 @@ async fn get_folder(
         Some(_) => return Err(AppError::BadRequest("unsupported sort mode".into())),
     };
 
+    // Filtre type de media : on garde toujours les dossiers pour pouvoir naviguer.
+    let media_clause = media_filter_clause(query.media.as_deref(), true)?;
+
     let sql = format!(
         r#"
         SELECT *
         FROM nodes
         WHERE parent_id = ?1
+        {media_clause}
         {order_by}
         "#
     );
@@ -309,6 +377,7 @@ async fn get_folder(
 struct FilesQuery {
     sort: Option<String>,
     q: Option<String>,
+    media: Option<String>,
 }
 
 async fn list_files(
@@ -336,6 +405,8 @@ async fn list_files(
         .filter(|value| !value.is_empty())
         .map(|value| format!("%{}%", value.to_lowercase()));
 
+    let media_clause = media_filter_clause(query.media.as_deref(), false)?;
+
     let sql = if search.is_some() {
         format!(
             r#"
@@ -343,6 +414,7 @@ async fn list_files(
             FROM nodes
             WHERE kind = 'file'
               AND (lower(name) LIKE ?1 OR lower(relative_path) LIKE ?1)
+            {media_clause}
             {order_by}
             "#
         )
@@ -352,6 +424,7 @@ async fn list_files(
             SELECT *
             FROM nodes
             WHERE kind = 'file'
+            {media_clause}
             {order_by}
             "#
         )
@@ -906,17 +979,19 @@ async fn create_share(
     let token_hash = auth::hash_token(&token);
     let share_id = Uuid::new_v4().to_string();
     let now = storage::now_ts();
+    let expires_at = now + SHARE_TTL_SECONDS;
 
     sqlx::query(
         r#"
-        INSERT INTO shares (id, file_id, token_hash, created_at, download_count)
-        VALUES (?1, ?2, ?3, ?4, 0)
+        INSERT INTO shares (id, file_id, token_hash, created_at, expires_at, download_count)
+        VALUES (?1, ?2, ?3, ?4, ?5, 0)
         "#,
     )
     .bind(&share_id)
     .bind(&id)
     .bind(token_hash)
     .bind(now)
+    .bind(expires_at)
     .execute(&state.db)
     .await?;
 
@@ -952,7 +1027,7 @@ async fn list_shares(
 
     let shares = sqlx::query_as::<_, ShareDto>(
         r#"
-        SELECT id, file_id, created_at, revoked_at, download_count
+        SELECT id, file_id, created_at, expires_at, revoked_at, download_count
         FROM shares
         WHERE file_id = ?1
         ORDER BY created_at DESC
@@ -1380,7 +1455,7 @@ async fn preview_cleanup_rows(state: &AppState, id: &str) -> AppResult<Vec<Previ
 async fn fetch_share_dto(state: &AppState, id: &str) -> AppResult<ShareDto> {
     sqlx::query_as::<_, ShareDto>(
         r#"
-        SELECT id, file_id, created_at, revoked_at, download_count
+        SELECT id, file_id, created_at, expires_at, revoked_at, download_count
         FROM shares
         WHERE id = ?1
         "#,
@@ -1393,14 +1468,16 @@ async fn fetch_share_dto(state: &AppState, id: &str) -> AppResult<ShareDto> {
 
 async fn lookup_public_share(state: &AppState, token: &str) -> AppResult<(ShareLookup, Node)> {
     let token_hash = auth::hash_token(token);
+    let now = storage::now_ts();
     let share = sqlx::query_as::<_, ShareLookup>(
         r#"
         SELECT id, file_id
         FROM shares
-        WHERE token_hash = ?1 AND revoked_at IS NULL
+        WHERE token_hash = ?1 AND revoked_at IS NULL AND expires_at > ?2
         "#,
     )
     .bind(token_hash)
+    .bind(now)
     .fetch_optional(&state.db)
     .await?
     .ok_or(AppError::NotFound)?;
