@@ -3,7 +3,10 @@ use std::{io::SeekFrom, net::SocketAddr, path::PathBuf};
 use axum::{
     Json, Router,
     body::Body,
-    extract::{ConnectInfo, Extension, Path, Query, State},
+    extract::{
+        ConnectInfo, Extension, Path, Query, State,
+        ws::{Message, WebSocket, WebSocketUpgrade},
+    },
     http::{
         HeaderMap, StatusCode,
         header::{
@@ -27,6 +30,7 @@ use crate::{
     AppState, auth,
     error::{AppError, AppResult},
     models::{Node, NodeDto, ROOT_ID, ShareDto, ShareLookup, node_to_dto},
+    realtime::RealtimeEvent,
     storage,
 };
 
@@ -34,6 +38,7 @@ pub fn build_router(state: AppState) -> Router {
     let protected = Router::new()
         .route("/auth/logout", post(logout))
         .route("/auth/me", get(me))
+        .route("/realtime", get(realtime_ws))
         .route("/folders/{id}", get(get_folder))
         .route("/folders/{parent_id}/folders", post(create_folder))
         .route("/folders/{parent_id}/files", post(upload_file))
@@ -153,6 +158,79 @@ async fn me(Extension(session): Extension<auth::AuthenticatedSession>) -> Json<M
     Json(MeResponse {
         expires_at: session.expires_at,
     })
+}
+
+#[derive(Deserialize)]
+struct RealtimeQuery {
+    client_id: Option<String>,
+}
+
+async fn realtime_ws(
+    State(state): State<AppState>,
+    Query(query): Query<RealtimeQuery>,
+    ws: WebSocketUpgrade,
+) -> Response {
+    let client_id = query.client_id.unwrap_or_default();
+    let receiver = state.realtime_tx.subscribe();
+    ws.on_upgrade(move |socket| realtime_socket(socket, receiver, client_id))
+}
+
+async fn realtime_socket(
+    mut socket: WebSocket,
+    mut receiver: tokio::sync::broadcast::Receiver<RealtimeEvent>,
+    client_id: String,
+) {
+    loop {
+        let event = match receiver.recv().await {
+            Ok(event) => event,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+        };
+
+        if event
+            .source_client_id()
+            .is_some_and(|source_client_id| source_client_id == client_id)
+        {
+            continue;
+        }
+
+        let Ok(payload) = serde_json::to_string(&event) else {
+            continue;
+        };
+
+        if socket.send(Message::Text(payload.into())).await.is_err() {
+            break;
+        }
+    }
+}
+
+fn request_client_id(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-nas-client-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && value.len() <= 128)
+        .map(ToOwned::to_owned)
+}
+
+fn broadcast_node_upsert(state: &AppState, headers: &HeaderMap, node: NodeDto) {
+    let _ = state.realtime_tx.send(RealtimeEvent::NodeUpsert {
+        node,
+        source_client_id: request_client_id(headers),
+    });
+}
+
+fn broadcast_node_deleted(
+    state: &AppState,
+    headers: &HeaderMap,
+    id: String,
+    parent_id: Option<String>,
+) {
+    let _ = state.realtime_tx.send(RealtimeEvent::NodeDeleted {
+        id,
+        parent_id,
+        source_client_id: request_client_id(headers),
+    });
 }
 
 #[derive(Serialize)]
@@ -383,6 +461,7 @@ struct CreateFolderRequest {
 async fn create_folder(
     State(state): State<AppState>,
     Path(parent_id): Path<String>,
+    headers: HeaderMap,
     Json(payload): Json<CreateFolderRequest>,
 ) -> AppResult<Json<NodeDto>> {
     let name = storage::validate_name(&payload.name)?;
@@ -416,7 +495,9 @@ async fn create_folder(
         return Err(error.into());
     }
 
-    Ok(Json(node_to_dto(fetch_node(&state, &id).await?)))
+    let node = node_to_dto(fetch_node(&state, &id).await?);
+    broadcast_node_upsert(&state, &headers, node.clone());
+    Ok(Json(node))
 }
 
 #[derive(Deserialize)]
@@ -504,7 +585,9 @@ async fn upload_file(
 
     tx.commit().await?;
 
-    Ok(Json(node_to_dto(fetch_node(&state, &id).await?)))
+    let node = node_to_dto(fetch_node(&state, &id).await?);
+    broadcast_node_upsert(&state, &headers, node.clone());
+    Ok(Json(node))
 }
 
 #[derive(Deserialize)]
@@ -604,7 +687,9 @@ async fn replace_file(
         let _ = storage::remove_file_if_exists(&state.config.preview_dir.join(preview_path)).await;
     }
 
-    Ok(Json(node_to_dto(fetch_node(&state, &id).await?)))
+    let node = node_to_dto(fetch_node(&state, &id).await?);
+    broadcast_node_upsert(&state, &headers, node.clone());
+    Ok(Json(node))
 }
 
 async fn upload_preview(
@@ -662,7 +747,9 @@ async fn upload_preview(
     .execute(&state.db)
     .await?;
 
-    Ok(Json(node_to_dto(fetch_node(&state, &id).await?)))
+    let node = node_to_dto(fetch_node(&state, &id).await?);
+    broadcast_node_upsert(&state, &headers, node.clone());
+    Ok(Json(node))
 }
 
 async fn download_file(
@@ -707,6 +794,7 @@ struct RenameRequest {
 async fn rename_node(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    headers: HeaderMap,
     Json(payload): Json<RenameRequest>,
 ) -> AppResult<Json<NodeDto>> {
     if id == ROOT_ID {
@@ -743,18 +831,22 @@ async fn rename_node(
     }
 
     tx.commit().await?;
-    Ok(Json(node_to_dto(fetch_node(&state, &id).await?)))
+    let node = node_to_dto(fetch_node(&state, &id).await?);
+    broadcast_node_upsert(&state, &headers, node.clone());
+    Ok(Json(node))
 }
 
 async fn delete_node(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    headers: HeaderMap,
 ) -> AppResult<StatusCode> {
     if id == ROOT_ID {
         return Err(AppError::Forbidden);
     }
 
     let node = fetch_node(&state, &id).await?;
+    let parent_id = node.parent_id.clone();
     let cleanup_rows = preview_cleanup_rows(&state, &id).await?;
     let source_path = storage::safe_join(&state.config.files_dir, &node.relative_path)?;
     let trash_path = state
@@ -788,6 +880,8 @@ async fn delete_node(
             fs::remove_file(&trash_path).await?;
         }
     }
+
+    broadcast_node_deleted(&state, &headers, id, parent_id);
 
     Ok(StatusCode::NO_CONTENT)
 }

@@ -1,5 +1,6 @@
 import {
   StrictMode,
+  type CSSProperties,
   type FormEvent,
   type MouseEvent as ReactMouseEvent,
   type PointerEvent as ReactPointerEvent,
@@ -13,8 +14,6 @@ import {
 import { createRoot } from "react-dom/client"
 import { BrowserRouter, Navigate, Route, Routes, useLocation, useNavigate, useParams, useSearchParams } from "react-router-dom"
 import {
-  ArrowDownAZ,
-  CalendarDays,
   Check,
   ChevronRight,
   Copy,
@@ -86,7 +85,9 @@ import "./styles.css"
 
 const ROOT_ID = "00000000-0000-0000-0000-000000000000"
 const TOKEN_KEY = "nas.session.token"
+const CLIENT_ID_KEY = "nas.client.id"
 const GRID_SIZE_KEY = "nas.gallery.grid-size"
+const GRID_COLUMNS_KEY = "nas.gallery.grid-columns"
 const VIEW_PARAM = "view"
 
 type NodeKind = "folder" | "file"
@@ -133,6 +134,10 @@ type ShareDto = {
 type SortMode = "name" | "date"
 type SearchScope = "current" | "all"
 type GridSize = "small" | "medium" | "large"
+type GalleryGridStyle = CSSProperties & {
+  "--gallery-mobile-columns": number
+  "--gallery-desktop-columns": number
+}
 type FileWithPath = File & { webkitRelativePath?: string }
 type FileSystemFileHandleLike = {
   kind: "file"
@@ -152,11 +157,29 @@ type NodeGroup = {
   id: string
   label: string
   nodes: NodeDto[]
+  children?: NodeGroup[]
 }
 
 type PendingFileImport = {
   files: File[]
   suggestedFolderName?: string
+}
+type PreviewUploadJob = {
+  source: "local-file"
+  file: File
+  fileId: string
+  name: string
+}
+type PreviewUploadStats = {
+  total: number
+  done: number
+  errors: number
+}
+type RemoteVideoPreviewStats = PreviewUploadStats
+type BatchShareLink = {
+  fileId: string
+  name: string
+  url: string
 }
 
 type DuplicateAction = "rename" | "skip" | "replace"
@@ -168,12 +191,35 @@ type DuplicateConflictRequest = {
   fileName: string
   resolve: (decision: DuplicateDecision) => void
 }
+type RealtimeEvent =
+  | {
+      type: "node_upsert"
+      node: NodeDto
+      source_client_id?: string | null
+    }
+  | {
+      type: "node_deleted"
+      id: string
+      parent_id?: string | null
+      source_client_id?: string | null
+    }
 
 const MEDIA_ACCEPT = "image/*,video/*"
-const GRID_SIZE_OPTIONS: Array<{ value: GridSize; label: string; min: number }> = [
-  { value: "small", label: "Petite", min: 116 },
-  { value: "medium", label: "Moyenne", min: 170 },
-  { value: "large", label: "Grande", min: 240 },
+const LIGHT_IMPORT_FILE_LIMIT = 20
+const LIGHT_IMPORT_BYTES_LIMIT = 384 * 1024 * 1024
+const LIGHT_IMPORT_BATCH_SIZE = 8
+const MOBILE_UPLOAD_CONCURRENCY = 2
+const DESKTOP_UPLOAD_CONCURRENCY = 4
+const MIN_GRID_COLUMNS = 1
+const MAX_GRID_COLUMNS = 12
+const SELECTION_LONG_PRESS_MS = 420
+const SELECTION_EXISTING_PRESS_MS = 180
+const SELECTION_AUTOSCROLL_EDGE = 88
+const SELECTION_AUTOSCROLL_MAX_SPEED = 18
+const GRID_SIZE_OPTIONS: Array<{ value: GridSize; label: string; columns: number }> = [
+  { value: "small", label: "Petite", columns: 4 },
+  { value: "medium", label: "Moyenne", columns: 3 },
+  { value: "large", label: "Grande", columns: 2 },
 ]
 const MEDIA_EXTENSIONS = new Set([
   "avif",
@@ -245,27 +291,29 @@ function ShareRoute() {
   return shareToken ? <SharePage shareToken={shareToken} /> : <Navigate to="/" replace />
 }
 
-function folderRoute(folderId: string, sortMode: SortMode, query = "", scope: SearchScope = "current") {
-  const params = new URLSearchParams({ sort: sortMode })
+function folderRoute(folderId: string, _sortMode: SortMode = "date", query = "", scope: SearchScope = "current") {
+  const params = new URLSearchParams()
   const trimmedQuery = query.trim()
   if (trimmedQuery) {
     params.set("q", trimmedQuery)
     params.set("scope", scope)
   }
-  return `/folder/${folderId}?${params}`
+  const search = params.toString()
+  return search ? `/folder/${folderId}?${search}` : `/folder/${folderId}`
 }
 
-function allFilesRoute(sortMode: SortMode, query = "") {
-  const params = new URLSearchParams({ sort: sortMode })
+function allFilesRoute(_sortMode: SortMode = "date", query = "") {
+  const params = new URLSearchParams()
   const trimmedQuery = query.trim()
   if (trimmedQuery) {
     params.set("q", trimmedQuery)
   }
-  return `/files?${params}`
+  const search = params.toString()
+  return search ? `/files?${search}` : "/files"
 }
 
-function parseSortMode(value: string | null): SortMode {
-  return value === "name" ? "name" : "date"
+function parseSortMode(_value: string | null): SortMode {
+  return "date"
 }
 
 function parseSearchScope(value: string | null): SearchScope {
@@ -274,6 +322,16 @@ function parseSearchScope(value: string | null): SearchScope {
 
 function parseGridSize(value: string | null): GridSize {
   return value === "small" || value === "large" ? value : "medium"
+}
+
+function parseGridColumns(value: string | null) {
+  const parsed = Number.parseInt(value ?? "", 10)
+  if (!Number.isFinite(parsed)) return 5
+  return clampGridColumns(parsed)
+}
+
+function clampGridColumns(value: number) {
+  return Math.min(MAX_GRID_COLUMNS, Math.max(MIN_GRID_COLUMNS, Math.round(value)))
 }
 
 /** Petit logo texte, reutilise partout pour rester coherent. */
@@ -360,11 +418,23 @@ function Login({ onLogin }: { onLogin: (token: string) => void }) {
   )
 }
 
-function useAuthedRequest(token: string, onAuthExpired: () => void) {
+function useClientId() {
+  return useMemo(() => {
+    const existing = sessionStorage.getItem(CLIENT_ID_KEY)
+    if (existing) return existing
+
+    const nextClientId = crypto.randomUUID()
+    sessionStorage.setItem(CLIENT_ID_KEY, nextClientId)
+    return nextClientId
+  }, [])
+}
+
+function useAuthedRequest(token: string, onAuthExpired: () => void, clientId: string) {
   return useCallback(
     async <T,>(path: string, init: RequestInit = {}) => {
       const headers = new Headers(init.headers)
       headers.set("Authorization", `Bearer ${token}`)
+      headers.set("X-NAS-Client-ID", clientId)
       if (init.body && !(init.body instanceof Blob) && !headers.has("Content-Type")) {
         headers.set("Content-Type", "application/json")
       }
@@ -382,8 +452,51 @@ function useAuthedRequest(token: string, onAuthExpired: () => void) {
       }
       return (await response.json()) as T
     },
-    [onAuthExpired, token],
+    [clientId, onAuthExpired, token],
   )
+}
+
+function useRealtimeEvents(token: string, clientId: string, onEvent: (event: RealtimeEvent) => void) {
+  const onEventRef = useRef(onEvent)
+
+  useEffect(() => {
+    onEventRef.current = onEvent
+  }, [onEvent])
+
+  useEffect(() => {
+    let socket: WebSocket | null = null
+    let reconnectTimer = 0
+    let closed = false
+
+    function connect() {
+      const protocol = window.location.protocol === "https:" ? "wss:" : "ws:"
+      const params = new URLSearchParams({ token, client_id: clientId })
+      socket = new WebSocket(`${protocol}//${window.location.host}/api/realtime?${params}`)
+
+      socket.onmessage = (event) => {
+        try {
+          const payload = JSON.parse(event.data) as RealtimeEvent
+          if (payload.source_client_id === clientId) return
+          onEventRef.current(payload)
+        } catch {
+          // Ignore malformed realtime payloads.
+        }
+      }
+
+      socket.onclose = () => {
+        if (closed) return
+        reconnectTimer = window.setTimeout(connect, 1500)
+      }
+    }
+
+    connect()
+
+    return () => {
+      closed = true
+      window.clearTimeout(reconnectTimer)
+      socket?.close()
+    }
+  }, [clientId, token])
 }
 
 function useGridSize() {
@@ -395,6 +508,144 @@ function useGridSize() {
   }, [])
 
   return [gridSize, setGridSize] as const
+}
+
+function useGridColumns() {
+  const [gridColumns, setGridColumnsState] = useState(() => parseGridColumns(localStorage.getItem(GRID_COLUMNS_KEY)))
+
+  const setGridColumns = useCallback((nextGridColumns: number) => {
+    const clamped = clampGridColumns(nextGridColumns)
+    setGridColumnsState(clamped)
+    localStorage.setItem(GRID_COLUMNS_KEY, String(clamped))
+  }, [])
+
+  return [gridColumns, setGridColumns] as const
+}
+
+function useRemoteVideoPreviewQueue({
+  token,
+  clientId,
+  onPreviewed,
+  pausedRef,
+}: {
+  token: string
+  clientId: string
+  onPreviewed: (node: NodeDto) => void
+  pausedRef?: { current: boolean }
+}) {
+  const queueRef = useRef<NodeDto[]>([])
+  const queuedIdsRef = useRef<Set<string>>(new Set())
+  const attemptedIdsRef = useRef<Set<string>>(new Set())
+  const statsRef = useRef<RemoteVideoPreviewStats>({ total: 0, done: 0, errors: 0 })
+  const runnerRef = useRef(false)
+  const toastIdRef = useRef(`remote-preview:${crypto.randomUUID()}`)
+  const onPreviewedRef = useRef(onPreviewed)
+  const pausedStateRef = useRef(pausedRef)
+
+  useEffect(() => {
+    onPreviewedRef.current = onPreviewed
+  }, [onPreviewed])
+
+  useEffect(() => {
+    pausedStateRef.current = pausedRef
+  }, [pausedRef])
+
+  const showQueueToast = useCallback((label: string, state: "active" | "done" | "error" = "active") => {
+    const stats = statsRef.current
+    const processed = stats.done + stats.errors
+    const progress = stats.total > 0 ? Math.round((processed / stats.total) * 100) : 0
+    showUploadToast(toastIdRef.current, `${stats.total} miniatures video`, progress, label, state)
+  }, [])
+
+  const runQueue = useCallback(async () => {
+    if (runnerRef.current) return
+    runnerRef.current = true
+
+    try {
+      while (queueRef.current.length > 0) {
+        if (pausedStateRef.current?.current) {
+          await releaseBrowserMemory(450)
+          continue
+        }
+
+        const node = queueRef.current.shift()
+        if (!node) continue
+
+        const currentIndex = statsRef.current.done + statsRef.current.errors + 1
+        showQueueToast(`Video ${currentIndex}/${statsRef.current.total}`)
+
+        try {
+          const previewed = await uploadStoredVideoPreview(token, clientId, node)
+          if (previewed) {
+            onPreviewedRef.current(previewed)
+            statsRef.current = {
+              ...statsRef.current,
+              done: statsRef.current.done + 1,
+            }
+          } else {
+            statsRef.current = {
+              ...statsRef.current,
+              errors: statsRef.current.errors + 1,
+            }
+          }
+        } catch {
+          statsRef.current = {
+            ...statsRef.current,
+            errors: statsRef.current.errors + 1,
+          }
+        } finally {
+          queuedIdsRef.current.delete(node.id)
+          await releaseBrowserMemory(260)
+        }
+      }
+    } finally {
+      runnerRef.current = false
+    }
+
+    if (queueRef.current.length === 0 && statsRef.current.total > 0) {
+      const stats = statsRef.current
+      showQueueToast(
+        stats.errors > 0 ? `${stats.done} creees, ${stats.errors} erreurs` : "Termine",
+        stats.errors > 0 ? "error" : "done",
+      )
+      statsRef.current = { total: 0, done: 0, errors: 0 }
+      toastIdRef.current = `remote-preview:${crypto.randomUUID()}`
+    }
+  }, [clientId, showQueueToast, token])
+
+  return useCallback(
+    (node: NodeDto) => {
+      if (!shouldGenerateStoredVideoPreview(node)) return
+      if (attemptedIdsRef.current.has(node.id) || queuedIdsRef.current.has(node.id)) return
+
+      attemptedIdsRef.current.add(node.id)
+      queuedIdsRef.current.add(node.id)
+      queueRef.current.push(node)
+      statsRef.current = {
+        ...statsRef.current,
+        total: statsRef.current.total + 1,
+      }
+      showQueueToast("En attente")
+      void runQueue()
+    },
+    [runQueue, showQueueToast],
+  )
+}
+
+function lockSelectionScroll() {
+  const preventTouchMove = (event: TouchEvent) => {
+    event.preventDefault()
+  }
+
+  document.body.classList.add("is-selecting-nodes")
+  document.documentElement.classList.add("is-selecting-nodes")
+  window.addEventListener("touchmove", preventTouchMove, { passive: false })
+
+  return () => {
+    window.removeEventListener("touchmove", preventTouchMove)
+    document.body.classList.remove("is-selecting-nodes")
+    document.documentElement.classList.remove("is-selecting-nodes")
+  }
 }
 
 function useNodeSelection(nodes: NodeDto[]) {
@@ -429,6 +680,7 @@ function useNodeSelection(nodes: NodeDto[]) {
     return () => {
       cleanupRef.current?.()
       document.body.classList.remove("is-selecting-nodes")
+      document.documentElement.classList.remove("is-selecting-nodes")
     }
   }, [])
 
@@ -436,18 +688,30 @@ function useNodeSelection(nodes: NodeDto[]) {
     setSelectedIds(new Set())
   }, [])
 
-  const setSelectedId = useCallback((id: string, selected: boolean) => {
-    if (!selectableIdsRef.current.has(id)) return
+  const selectAll = useCallback(() => {
+    setSelectedIds(new Set(selectableIdsRef.current))
+  }, [])
+
+  const setSelectedIdsInRange = useCallback((ids: string[], selected: boolean) => {
+    const selectable = selectableIdsRef.current
+    const safeIds = ids.filter((id) => selectable.has(id))
+    if (safeIds.length === 0) return
+
     setSelectedIds((current) => {
-      if (selected && current.has(id)) return current
-      if (!selected && !current.has(id)) return current
+      let changed = false
       const next = new Set(current)
-      if (selected) {
-        next.add(id)
-      } else {
-        next.delete(id)
+      for (const id of safeIds) {
+        if (selected) {
+          if (!next.has(id)) {
+            next.add(id)
+            changed = true
+          }
+        } else if (next.has(id)) {
+          next.delete(id)
+          changed = true
+        }
       }
-      return next
+      return changed ? next : current
     })
   }, [])
 
@@ -464,13 +728,34 @@ function useNodeSelection(nodes: NodeDto[]) {
     })
   }, [])
 
-  const applySelectionAtPoint = useCallback(
-    (x: number, y: number, selected: boolean) => {
-      const element = document.elementFromPoint(x, y)?.closest("[data-node-id]") as HTMLElement | null
-      const id = element?.dataset.nodeId
-      if (id) setSelectedId(id, selected)
+  const applySelectionRange = useCallback(
+    (fromIndex: number, toIndex: number, selected: boolean) => {
+      const min = Math.min(fromIndex, toIndex)
+      const max = Math.max(fromIndex, toIndex)
+      const ids = Array.from(document.querySelectorAll<HTMLElement>("[data-node-id][data-node-index]"))
+        .filter((element) => {
+          const index = Number(element.dataset.nodeIndex)
+          return Number.isFinite(index) && index >= min && index <= max
+        })
+        .sort((left, right) => Number(left.dataset.nodeIndex) - Number(right.dataset.nodeIndex))
+        .map((element) => element.dataset.nodeId)
+        .filter((id): id is string => !!id)
+
+      setSelectedIdsInRange(ids, selected)
     },
-    [setSelectedId],
+    [setSelectedIdsInRange],
+  )
+
+  const applySelectionAtPoint = useCallback(
+    (x: number, y: number, selected: boolean, previousIndex: number | null) => {
+      const element = document.elementFromPoint(x, y)?.closest("[data-node-id]") as HTMLElement | null
+      const index = Number(element?.dataset.nodeIndex)
+      if (!element?.dataset.nodeId || !Number.isFinite(index)) return previousIndex
+
+      applySelectionRange(previousIndex ?? index, index, selected)
+      return index
+    },
+    [applySelectionRange],
   )
 
   const handlePointerDown = useCallback(
@@ -482,43 +767,114 @@ function useNodeSelection(nodes: NodeDto[]) {
 
       const selectionModeAtStart = selectedIdsRef.current.size > 0
       const shouldSelect = !selectedIdsRef.current.has(node.id)
+      const pointerTarget = event.currentTarget
       const gesture = {
         active: false,
         cancelled: false,
         startX: event.clientX,
         startY: event.clientY,
+        pointerX: event.clientX,
+        pointerY: event.clientY,
+        lastIndex: null as number | null,
+        scrollSpeed: 0,
+        animationFrame: 0,
         timer: 0,
+      }
+      let unlockSelectionScroll: (() => void) | null = null
+
+      const stopAutoScroll = () => {
+        if (gesture.animationFrame) {
+          window.cancelAnimationFrame(gesture.animationFrame)
+          gesture.animationFrame = 0
+        }
+        gesture.scrollSpeed = 0
+      }
+
+      const runAutoScroll = () => {
+        gesture.animationFrame = 0
+        if (!gesture.active || gesture.scrollSpeed === 0) return
+
+        window.scrollBy({ top: gesture.scrollSpeed, behavior: "auto" })
+        gesture.lastIndex = applySelectionAtPoint(gesture.pointerX, gesture.pointerY, shouldSelect, gesture.lastIndex)
+        gesture.animationFrame = window.requestAnimationFrame(runAutoScroll)
+      }
+
+      const updateAutoScroll = (clientY: number) => {
+        const viewportHeight = window.visualViewport?.height ?? window.innerHeight
+        const topDistance = clientY
+        const bottomDistance = viewportHeight - clientY
+        let nextSpeed = 0
+
+        if (topDistance < SELECTION_AUTOSCROLL_EDGE) {
+          const intensity = (SELECTION_AUTOSCROLL_EDGE - Math.max(0, topDistance)) / SELECTION_AUTOSCROLL_EDGE
+          nextSpeed = -Math.ceil(intensity * SELECTION_AUTOSCROLL_MAX_SPEED)
+        } else if (bottomDistance < SELECTION_AUTOSCROLL_EDGE) {
+          const intensity = (SELECTION_AUTOSCROLL_EDGE - Math.max(0, bottomDistance)) / SELECTION_AUTOSCROLL_EDGE
+          nextSpeed = Math.ceil(intensity * SELECTION_AUTOSCROLL_MAX_SPEED)
+        }
+
+        gesture.scrollSpeed = nextSpeed
+        if (nextSpeed !== 0 && gesture.animationFrame === 0) {
+          gesture.animationFrame = window.requestAnimationFrame(runAutoScroll)
+        }
       }
 
       const startSelection = () => {
         if (gesture.active || gesture.cancelled) return
         gesture.active = true
-        document.body.classList.add("is-selecting-nodes")
-        setSelectedId(node.id, shouldSelect)
+        unlockSelectionScroll = lockSelectionScroll()
+        try {
+          pointerTarget.setPointerCapture(event.pointerId)
+        } catch {
+          // Pointer capture may fail if the browser already cancelled the touch gesture.
+        }
+        const startElement = pointerTarget.closest("[data-node-id]") as HTMLElement | null
+        const startIndex = Number(startElement?.dataset.nodeIndex)
+        gesture.lastIndex = Number.isFinite(startIndex) ? startIndex : null
+        if (gesture.lastIndex !== null) {
+          applySelectionRange(gesture.lastIndex, gesture.lastIndex, shouldSelect)
+        }
+        gesture.lastIndex = applySelectionAtPoint(gesture.pointerX, gesture.pointerY, shouldSelect, gesture.lastIndex)
+        updateAutoScroll(gesture.pointerY)
         navigator.vibrate?.(8)
       }
 
-      if (!selectionModeAtStart) {
-        gesture.timer = window.setTimeout(startSelection, 420)
+      if (selectionModeAtStart) {
+        gesture.timer = window.setTimeout(startSelection, SELECTION_EXISTING_PRESS_MS)
+      } else {
+        gesture.timer = window.setTimeout(startSelection, SELECTION_LONG_PRESS_MS)
       }
 
       function cleanup() {
         window.clearTimeout(gesture.timer)
+        stopAutoScroll()
         window.removeEventListener("pointermove", handleMove)
         window.removeEventListener("pointerup", handleEnd)
         window.removeEventListener("pointercancel", handleEnd)
-        document.body.classList.remove("is-selecting-nodes")
+        unlockSelectionScroll?.()
+        try {
+          if (pointerTarget.hasPointerCapture(event.pointerId)) {
+            pointerTarget.releasePointerCapture(event.pointerId)
+          }
+        } catch {
+          // Ignore pointer capture cleanup failures.
+        }
         cleanupRef.current = null
       }
 
       function handleMove(moveEvent: globalThis.PointerEvent) {
         if (moveEvent.pointerId !== event.pointerId) return
+        gesture.pointerX = moveEvent.clientX
+        gesture.pointerY = moveEvent.clientY
 
         const distance = Math.hypot(moveEvent.clientX - gesture.startX, moveEvent.clientY - gesture.startY)
+        const dragStartDistance = event.pointerType === "touch" ? 10 : 8
+        const cancelDistance = event.pointerType === "touch" ? 30 : 18
         if (!gesture.active) {
-          if (selectionModeAtStart && distance > 8) {
-            startSelection()
-          } else if (!selectionModeAtStart && distance > 18) {
+          if (selectionModeAtStart && distance > dragStartDistance) {
+            gesture.cancelled = true
+            window.clearTimeout(gesture.timer)
+          } else if (!selectionModeAtStart && distance > cancelDistance) {
             gesture.cancelled = true
             window.clearTimeout(gesture.timer)
           }
@@ -526,7 +882,8 @@ function useNodeSelection(nodes: NodeDto[]) {
 
         if (gesture.active) {
           moveEvent.preventDefault()
-          applySelectionAtPoint(moveEvent.clientX, moveEvent.clientY, shouldSelect)
+          gesture.lastIndex = applySelectionAtPoint(moveEvent.clientX, moveEvent.clientY, shouldSelect, gesture.lastIndex)
+          updateAutoScroll(moveEvent.clientY)
         }
       }
 
@@ -544,7 +901,7 @@ function useNodeSelection(nodes: NodeDto[]) {
       window.addEventListener("pointerup", handleEnd, { passive: false })
       window.addEventListener("pointercancel", handleEnd, { passive: false })
     },
-    [applySelectionAtPoint, setSelectedId],
+    [applySelectionAtPoint, applySelectionRange],
   )
 
   const handleClick = useCallback(
@@ -573,6 +930,7 @@ function useNodeSelection(nodes: NodeDto[]) {
     selectedNodes,
     selectionMode: selectedIds.size > 0,
     clearSelection,
+    selectAll,
     handlePointerDown,
     handleClick,
   }
@@ -598,6 +956,8 @@ function FileManager({ token, onAuthExpired }: { token: string; onAuthExpired: (
   const [renameTarget, setRenameTarget] = useState<NodeDto | null>(null)
   const [renameValue, setRenameValue] = useState("")
   const [deleteTarget, setDeleteTarget] = useState<NodeDto | null>(null)
+  const [batchDeleteNodes, setBatchDeleteNodes] = useState<NodeDto[]>([])
+  const [batchShareFiles, setBatchShareFiles] = useState<NodeDto[]>([])
   const [shareNode, setShareNode] = useState<NodeDto | null>(null)
   const [detailsNode, setDetailsNode] = useState<NodeDto | null>(null)
   const [viewerNode, setViewerNode] = useState<NodeDto | null>(null)
@@ -606,8 +966,16 @@ function FileManager({ token, onAuthExpired }: { token: string; onAuthExpired: (
   const [duplicateConflict, setDuplicateConflict] = useState<DuplicateConflictRequest | null>(null)
   const fileInput = useRef<HTMLInputElement>(null)
   const directoryInput = useRef<HTMLInputElement | null>(null)
-  const request = useAuthedRequest(token, onAuthExpired)
+  const clientId = useClientId()
+  const request = useAuthedRequest(token, onAuthExpired, clientId)
   const [gridSize, setGridSize] = useGridSize()
+  const [gridColumns, setGridColumns] = useGridColumns()
+  const uploadActiveRef = useRef(false)
+  const previewQueueRef = useRef<PreviewUploadJob[]>([])
+  const previewStatsRef = useRef<PreviewUploadStats>({ total: 0, done: 0, errors: 0 })
+  const previewRunnerRef = useRef(false)
+  const previewToastIdRef = useRef(`preview:${crypto.randomUUID()}`)
+  const duplicatePromptQueueRef = useRef<Promise<void>>(Promise.resolve())
 
   const fetchFolder = useCallback(
     async (id: string, nextSortMode: SortMode) => {
@@ -669,10 +1037,6 @@ function FileManager({ token, onAuthExpired }: { token: string; onAuthExpired: (
     return () => window.clearTimeout(timer)
   }, [navigate, query, routeFolderId, searchScope, searchValue, sortMode])
 
-  function changeSortMode(nextSortMode: SortMode) {
-    navigate(folderRoute(routeFolderId, nextSortMode, query, searchScope))
-  }
-
   function changeSearchScope(nextScope: SearchScope) {
     navigate(folderRoute(routeFolderId, sortMode, query, nextScope), { replace: true })
   }
@@ -716,14 +1080,24 @@ function FileManager({ token, onAuthExpired }: { token: string; onAuthExpired: (
     if (!name) return
 
     try {
-      await createFolderNamed(name)
+      const folder = await createFolderNamed(name)
+      upsertVisibleChild(folder)
       setNewFolderName("")
       setCreateOpen(false)
       toast.success("Dossier cree")
-      await fetchFolder(routeFolderId, sortMode)
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Creation impossible.")
     }
+  }
+
+  function upsertVisibleChild(node: NodeDto) {
+    setData((current) => {
+      if (!current || node.parent_id !== current.folder.id) return current
+      return {
+        ...current,
+        children: sortNodesForMode(upsertNode(current.children, node), sortMode),
+      }
+    })
   }
 
   function openRename(node: NodeDto) {
@@ -771,9 +1145,57 @@ function FileManager({ token, onAuthExpired }: { token: string; onAuthExpired: (
     }
   }
 
-  function startFileImport(files: FileList | File[] | null, suggestedFolderName?: string) {
+  async function submitBatchDelete() {
+    const targets = batchDeleteNodes
+    if (targets.length === 0) return
+
+    const targetIds = new Set(targets.map((node) => node.id))
+    let deletedCount = 0
+    let errorCount = 0
+
+    for (const target of targets) {
+      try {
+        await request<void>(`/api/nodes/${target.id}`, { method: "DELETE" })
+        deletedCount += 1
+      } catch {
+        errorCount += 1
+      }
+    }
+
+    setBatchDeleteNodes([])
+    selection.clearSelection()
+    setDetailsNode((current) => (current && targetIds.has(current.id) ? null : current))
+    setViewerNode((current) => (current && targetIds.has(current.id) ? null : current))
+    setData((current) => current ? { ...current, children: removeNodesByIds(current.children, targetIds) } : current)
+    setSearchResults((current) => removeNodesByIds(current, targetIds))
+
+    if (deletedCount > 0) {
+      toast.success(`${deletedCount} element${deletedCount > 1 ? "s" : ""} supprime${deletedCount > 1 ? "s" : ""}`)
+    }
+    if (errorCount > 0) {
+      toast.error(`${errorCount} suppression${errorCount > 1 ? "s" : ""} impossible${errorCount > 1 ? "s" : ""}`)
+    }
+  }
+
+  function importSelectedFiles(files: FileList | File[] | null) {
     const selectedFiles = Array.from(files ?? [])
-    if (selectedFiles.length === 0) return
+    if (selectedFiles.length === 0) {
+      toast.warning("Aucun fichier recu", {
+        description: "Le navigateur n'a pas transmis de fichier apres la selection.",
+      })
+      return
+    }
+    void uploadFiles(selectedFiles)
+  }
+
+  function startDirectoryImport(files: FileList | File[] | null, suggestedFolderName?: string) {
+    const selectedFiles = Array.from(files ?? [])
+    if (selectedFiles.length === 0) {
+      toast.warning("Aucun fichier recu", {
+        description: "Le navigateur n'a pas transmis de fichier apres la selection.",
+      })
+      return
+    }
     setPendingFileImport({ files: selectedFiles, suggestedFolderName })
     setImportFolderName(defaultImportFolderName(selectedFiles, suggestedFolderName))
   }
@@ -782,7 +1204,7 @@ function FileManager({ token, onAuthExpired }: { token: string; onAuthExpired: (
     const pending = pendingFileImport
     if (!pending) return
     setPendingFileImport(null)
-    await uploadFiles(pending.files)
+    await uploadFiles(pending.files, { stripImportedRoot: true })
   }
 
   async function importPendingFilesInNewFolder() {
@@ -792,24 +1214,114 @@ function FileManager({ token, onAuthExpired }: { token: string; onAuthExpired: (
 
     try {
       const folder = await createFolderNamed(name)
+      upsertVisibleChild(folder)
       setPendingFileImport(null)
       toast.success("Dossier cree")
-      await uploadFiles(pending.files, { baseFolderId: folder.id })
+      await uploadFiles(pending.files, { baseFolderId: folder.id, stripImportedRoot: true })
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Creation impossible.")
     }
   }
 
   function askDuplicateConflict(fileName: string) {
-    return new Promise<DuplicateDecision>((resolve) => {
+    const queuedDecision = duplicatePromptQueueRef.current.then(() => new Promise<DuplicateDecision>((resolve) => {
       setDuplicateConflict({ fileName, resolve })
-    })
+    }))
+    duplicatePromptQueueRef.current = queuedDecision.then(() => undefined, () => undefined)
+    return queuedDecision
   }
 
-  async function uploadFiles(files: FileList | File[], options: { baseFolderId?: string } = {}) {
-    const currentFolderAtStart = routeFolderId
+  function showPreviewQueueToast(label: string, state: "active" | "done" | "error" = "active") {
+    const stats = previewStatsRef.current
+    const processed = stats.done + stats.errors
+    const progress = stats.total > 0 ? Math.round((processed / stats.total) * 100) : 0
+    showUploadToast(previewToastIdRef.current, `${stats.total} miniatures`, progress, label, state)
+  }
+
+  function enqueuePreviewUpload(file: File, node: NodeDto, lightImport: boolean) {
+    if (isVideoFile(file)) return
+    if (!shouldQueueClientPreview(file, lightImport)) return
+
+    previewQueueRef.current.push({ source: "local-file", file, fileId: node.id, name: node.name })
+    previewStatsRef.current = {
+      ...previewStatsRef.current,
+      total: previewStatsRef.current.total + 1,
+    }
+    showPreviewQueueToast("En attente")
+    void runPreviewQueue()
+  }
+
+  async function runPreviewQueue() {
+    if (previewRunnerRef.current) return
+    previewRunnerRef.current = true
+
+    try {
+      while (previewQueueRef.current.length > 0) {
+        if (uploadActiveRef.current) {
+          await releaseBrowserMemory(350)
+          continue
+        }
+
+        const job = previewQueueRef.current.shift()
+        if (!job) continue
+
+        const currentIndex = previewStatsRef.current.done + previewStatsRef.current.errors + 1
+        showPreviewQueueToast(`Miniature ${currentIndex}/${previewStatsRef.current.total}`)
+
+        try {
+          const previewed = await uploadClientPreview(token, clientId, job.fileId, job.file)
+          if (previewed) {
+            upsertClientNode(previewed)
+          }
+          previewStatsRef.current = {
+            ...previewStatsRef.current,
+            done: previewStatsRef.current.done + 1,
+          }
+        } catch {
+          previewStatsRef.current = {
+            ...previewStatsRef.current,
+            errors: previewStatsRef.current.errors + 1,
+          }
+        } finally {
+          await releaseBrowserMemory(220)
+        }
+      }
+    } finally {
+      previewRunnerRef.current = false
+    }
+
+    if (previewQueueRef.current.length === 0 && !uploadActiveRef.current && previewStatsRef.current.total > 0) {
+      const stats = previewStatsRef.current
+      showPreviewQueueToast(
+        stats.errors > 0 ? `${stats.done} creees, ${stats.errors} erreurs` : "Termine",
+        stats.errors > 0 ? "error" : "done",
+      )
+      previewStatsRef.current = { total: 0, done: 0, errors: 0 }
+      previewToastIdRef.current = `preview:${crypto.randomUUID()}`
+    }
+  }
+
+  function upsertClientNode(node: NodeDto) {
+    setData((current) => {
+      if (!current) return current
+      const children = reconcileNodeChildren(current.children, node, current.folder.id, sortMode)
+      return children === current.children ? current : { ...current, children }
+    })
+    setSearchResults((current) =>
+      reconcileSearchNodes(current, node, query, searchScope, data?.folder ?? null, sortMode),
+    )
+    setDetailsNode((current) => (current?.id === node.id ? node : current))
+    setViewerNode((current) => (current?.id === node.id && node.kind === "file" ? node : current))
+  }
+
+  async function uploadFiles(
+    files: FileList | File[],
+    options: { baseFolderId?: string; stripImportedRoot?: boolean } = {},
+  ) {
     const uploadRootId = options.baseFolderId ?? routeFolderId
     let duplicatePolicy: DuplicateAction | null = null
+    let successCount = 0
+    let errorCount = 0
     const candidates = Array.from(files)
     if (candidates.length === 0) {
       toast.info("Aucun fichier recu", { description: "Le navigateur n'a renvoye aucun fichier pour ce dossier." })
@@ -828,58 +1340,139 @@ function FileManager({ token, onAuthExpired }: { token: string; onAuthExpired: (
       return
     }
 
-    const folderCache = new Map<string, string>()
-    for (const file of mediaFiles) {
-      const folderSegments = importFolderSegments(file)
-      const toastId = `upload:${crypto.randomUUID()}`
-      const toastName = uploadDisplayName(file)
-      showUploadToast(toastId, toastName, 0, "Envoi")
-
-      try {
-        const targetFolderId = folderSegments.length
-          ? await ensureFolderPath(request, uploadRootId, folderSegments, folderCache)
-          : uploadRootId
-        const uploaded = await uploadFileWithConflictHandling({
-          request,
-          token,
-          folderId: targetFolderId,
-          file,
-          onProgress: (progress) => showUploadToast(toastId, toastName, progress, "Envoi"),
-          getDuplicateDecision: async (fileName) => {
-            if (duplicatePolicy) {
-              return { action: duplicatePolicy, applyToAll: false }
-            }
-
-            const decision = await askDuplicateConflict(fileName)
-            if (decision.applyToAll) {
-              duplicatePolicy = decision.action
-            }
-            return decision
-          },
-        })
-
-        if (!uploaded) {
-          showUploadToast(toastId, toastName, 100, "Ignore", "done")
-          continue
-        }
-
-        if (isPreviewCandidate(file)) {
-          showUploadToast(toastId, toastName, 100, "Miniature")
-          try {
-            await uploadClientPreview(token, uploaded.id, file)
-          } catch {
-            toast.warning("Miniature non generee", { description: toastName })
-          }
-        }
-
-        showUploadToast(toastId, toastName, 100, "Termine", "done")
-      } catch (err) {
-        showUploadToast(toastId, toastName, 100, err instanceof Error ? err.message : "Upload impossible", "error")
-      }
+    const strippedRoot = options.stripImportedRoot ? commonImportedRoot(mediaFiles) : ""
+    const lightImport = shouldUseLightImport(mediaFiles)
+    const batchToastId = lightImport ? `upload-batch:${crypto.randomUUID()}` : null
+    if (lightImport && batchToastId) {
+      toast.info("Mode import leger", {
+        description: "Import par lots sans miniatures locales pour limiter la memoire de Brave.",
+      })
+      showUploadToast(batchToastId, `${mediaFiles.length} medias`, 0, "Preparation")
     }
 
-    if (currentFolderAtStart === routeFolderId) {
-      await fetchFolder(routeFolderId, sortMode)
+    const uploadConcurrency = uploadConcurrencyFor(mediaFiles, lightImport)
+    if (mediaFiles.length > 1 && uploadConcurrency > 1) {
+      toast.info("Uploads paralleles", {
+        description: `${uploadConcurrency} fichiers envoyes en meme temps.`,
+      })
+    }
+
+    uploadActiveRef.current = true
+    try {
+      const folderCache = new Map<string, string>()
+      const progressByIndex = new Array<number>(mediaFiles.length).fill(0)
+      const batchSize = lightImport ? LIGHT_IMPORT_BATCH_SIZE : mediaFiles.length
+      const totalBatches = Math.max(1, Math.ceil(mediaFiles.length / batchSize))
+
+      const uploadFileAtIndex = async (fileIndex: number) => {
+        const file = mediaFiles[fileIndex]
+        const folderSegments = importFolderSegments(file, strippedRoot)
+        const toastId = batchToastId ?? `upload:${crypto.randomUUID()}`
+        const fileName = uploadDisplayName(file, strippedRoot)
+        const toastName = lightImport ? `Import ${fileIndex + 1}/${mediaFiles.length}` : fileName
+        const updateToast = (progress: number, label: string, state: "active" | "done" | "error" = "active") => {
+          const boundedProgress = Math.max(0, Math.min(100, progress))
+          const toastState = lightImport ? "active" : state
+          const nextProgress = lightImport
+            ? Math.min(
+                99,
+                Math.round(
+                  progressByIndex.reduce((total, current, index) => {
+                    return total + (index === fileIndex ? Math.max(current, boundedProgress) : current)
+                  }, 0) / mediaFiles.length,
+                ),
+              )
+            : boundedProgress
+
+          progressByIndex[fileIndex] = Math.max(progressByIndex[fileIndex] ?? 0, boundedProgress)
+          showUploadToast(toastId, toastName, nextProgress, lightImport ? `${label} - ${fileName}` : label, toastState)
+        }
+
+        updateToast(0, "Envoi")
+
+        try {
+          const targetFolderId = folderSegments.length
+            ? await ensureFolderPath(request, uploadRootId, folderSegments, folderCache, upsertVisibleChild)
+            : uploadRootId
+          const uploaded = await uploadFileWithConflictHandling({
+            request,
+            token,
+            clientId,
+            folderId: targetFolderId,
+            file,
+            onProgress: (progress) => updateToast(progress, "Envoi"),
+            getDuplicateDecision: async (fileName) => {
+              if (duplicatePolicy) {
+                return { action: duplicatePolicy, applyToAll: false }
+              }
+
+              const decision = await askDuplicateConflict(fileName)
+              if (decision.applyToAll) {
+                duplicatePolicy = decision.action
+              }
+              return decision
+            },
+          })
+
+          if (!uploaded) {
+            updateToast(100, "Ignore", "done")
+            return
+          }
+
+          upsertVisibleChild(uploaded)
+          if (isVideoFile(file)) {
+            queueVideoPreview(uploaded)
+          } else {
+            enqueuePreviewUpload(file, uploaded, lightImport)
+          }
+          successCount += 1
+          updateToast(100, "Termine", "done")
+        } catch (err) {
+          errorCount += 1
+          updateToast(100, err instanceof Error ? err.message : "Upload impossible", "error")
+        } finally {
+          await releaseBrowserMemory()
+        }
+      }
+
+      for (let batchStart = 0; batchStart < mediaFiles.length; batchStart += batchSize) {
+        const batchNumber = Math.floor(batchStart / batchSize) + 1
+        const batchEnd = Math.min(batchStart + batchSize, mediaFiles.length)
+        if (lightImport && batchToastId) {
+          showUploadToast(
+            batchToastId,
+            `${mediaFiles.length} medias`,
+            Math.round((batchStart / mediaFiles.length) * 100),
+            `Lot ${batchNumber}/${totalBatches}`,
+          )
+        }
+
+        const batchIndexes = Array.from({ length: batchEnd - batchStart }, (_, index) => batchStart + index)
+        let nextBatchIndex = 0
+        const workerCount = Math.min(uploadConcurrency, batchIndexes.length)
+        await Promise.all(
+          Array.from({ length: workerCount }, async () => {
+            for (;;) {
+              const fileIndex = batchIndexes[nextBatchIndex]
+              nextBatchIndex += 1
+              if (fileIndex === undefined) return
+              await uploadFileAtIndex(fileIndex)
+            }
+          }),
+        )
+
+        if (lightImport) {
+          await releaseBrowserMemory(250)
+        }
+      }
+
+      if (lightImport && batchToastId) {
+        const label = errorCount > 0 ? `${successCount} importes, ${errorCount} erreurs` : "Termine"
+        showUploadToast(batchToastId, `${mediaFiles.length} medias`, 100, label, errorCount > 0 ? "error" : "done")
+      }
+    } finally {
+      uploadActiveRef.current = false
+      void runPreviewQueue()
     }
   }
 
@@ -893,7 +1486,7 @@ function FileManager({ token, onAuthExpired }: { token: string; onAuthExpired: (
           toast.info("Aucun media trouve", { description: "Le dossier ne contient pas d'image ou de video." })
           return
         }
-        startFileImport(files, directory.name)
+        startDirectoryImport(files, directory.name)
       } catch (err) {
         if (err instanceof DOMException && err.name === "AbortError") return
         toast.error("Import dossier impossible.")
@@ -912,9 +1505,15 @@ function FileManager({ token, onAuthExpired }: { token: string; onAuthExpired: (
     fileInput.current?.click()
   }
 
+  const queueVideoPreview = useRemoteVideoPreviewQueue({
+    token,
+    clientId,
+    onPreviewed: upsertClientNode,
+  })
   const visibleNodes = searchActive ? searchResults : (data?.children ?? [])
   const groups = useMemo(() => groupNodesBySort(visibleNodes, sortMode), [visibleNodes, sortMode])
   const selection = useNodeSelection(visibleNodes)
+  const selectedFiles = useMemo(() => selection.selectedNodes.filter(isFileNode), [selection.selectedNodes])
 
   useEffect(() => {
     if (!viewerId) {
@@ -926,6 +1525,39 @@ function FileManager({ token, onAuthExpired }: { token: string; onAuthExpired: (
     setViewerNode(node ?? null)
   }, [viewerId, visibleNodes])
 
+  const handleRealtimeEvent = useCallback(
+    (event: RealtimeEvent) => {
+      if (event.source_client_id === clientId) return
+
+      if (event.type === "node_upsert") {
+        const node = event.node
+        setData((current) => {
+          if (!current) return current
+          const children = reconcileNodeChildren(current.children, node, current.folder.id, sortMode)
+          return children === current.children ? current : { ...current, children }
+        })
+        setSearchResults((current) =>
+          reconcileSearchNodes(current, node, query, searchScope, data?.folder ?? null, sortMode),
+        )
+        setDetailsNode((current) => (current?.id === node.id ? node : current))
+        setViewerNode((current) => (current?.id === node.id && node.kind === "file" ? node : current))
+        return
+      }
+
+      setData((current) => {
+        if (!current) return current
+        const children = removeNodeById(current.children, event.id)
+        return children === current.children ? current : { ...current, children }
+      })
+      setSearchResults((current) => removeNodeById(current, event.id))
+      setDetailsNode((current) => (current?.id === event.id ? null : current))
+      setViewerNode((current) => (current?.id === event.id ? null : current))
+    },
+    [clientId, data?.folder, query, searchScope, sortMode],
+  )
+
+  useRealtimeEvents(token, clientId, handleRealtimeEvent)
+
   return (
     <div className="min-h-svh" onContextMenu={preventAppContextMenu}>
       <main className="mx-auto w-full max-w-6xl px-4 pb-24 pt-[env(safe-area-inset-top)] sm:pb-12 sm:pt-6">
@@ -934,15 +1566,22 @@ function FileManager({ token, onAuthExpired }: { token: string; onAuthExpired: (
           onValueChange={setSearchValue}
           scope={searchScope}
           onScopeChange={changeSearchScope}
-          sortMode={sortMode}
-          onSortChange={changeSortMode}
           currentLabel={data?.folder.name || "Racine"}
           loading={searchLoading}
           gridSize={gridSize}
           onGridSizeChange={setGridSize}
+          gridColumns={gridColumns}
+          onGridColumnsChange={setGridColumns}
         />
 
-        <SelectionBar count={selection.selectedNodes.length} onClear={selection.clearSelection} />
+        <SelectionBar
+          count={selection.selectedNodes.length}
+          fileCount={selectedFiles.length}
+          onSelectAll={selection.selectAll}
+          onClear={selection.clearSelection}
+          onShare={() => setBatchShareFiles(selectedFiles)}
+          onDelete={() => setBatchDeleteNodes(selection.selectedNodes)}
+        />
 
         <MobileActionMenu
           actions={[
@@ -955,7 +1594,11 @@ function FileManager({ token, onAuthExpired }: { token: string; onAuthExpired: (
             {
               label: "Envoyer des fichiers",
               icon: <Upload />,
-              onSelect: () => fileInput.current?.click(),
+              fileInput: {
+                accept: MEDIA_ACCEPT,
+                multiple: true,
+                onChange: importSelectedFiles,
+              },
             },
             {
               label: "Importer un dossier",
@@ -974,7 +1617,7 @@ function FileManager({ token, onAuthExpired }: { token: string; onAuthExpired: (
           multiple
           type="file"
           onChange={(event) => {
-            startFileImport(event.target.files)
+            importSelectedFiles(event.target.files)
             event.target.value = ""
           }}
         />
@@ -999,7 +1642,7 @@ function FileManager({ token, onAuthExpired }: { token: string; onAuthExpired: (
               event.target.value = ""
               return
             }
-            startFileImport(event.target.files)
+            startDirectoryImport(event.target.files)
             event.target.value = ""
           }}
         />
@@ -1041,7 +1684,7 @@ function FileManager({ token, onAuthExpired }: { token: string; onAuthExpired: (
           <Breadcrumbs items={data.breadcrumbs} onNavigate={openFolder} />
         )}
 
-        <DropZone onFiles={startFileImport}>
+        <DropZone onFiles={importSelectedFiles}>
           {searchActive && (
             <div className="mb-3 flex items-center justify-between gap-3 text-sm text-muted-foreground">
               <span>
@@ -1055,13 +1698,14 @@ function FileManager({ token, onAuthExpired }: { token: string; onAuthExpired: (
           )}
           {searchActive ? (
             searchLoading ? (
-              <LoadingGrid gridSize={gridSize} />
+              <LoadingGrid gridSize={gridSize} gridColumns={gridColumns} />
             ) : searchResults.length > 0 ? (
               <GroupedNodeGrid
                 groups={groups}
                 sortMode={sortMode}
                 token={token}
                 gridSize={gridSize}
+                gridColumns={gridColumns}
                 showPath
                 onOpen={(node) => (node.kind === "folder" ? openFolder(node.id) : openViewer(node))}
                 selectedIds={selection.selectedIds}
@@ -1073,13 +1717,14 @@ function FileManager({ token, onAuthExpired }: { token: string; onAuthExpired: (
               <SearchEmptyState query={query} scope={searchScope} />
             )
           ) : loading ? (
-            <LoadingGrid gridSize={gridSize} />
+            <LoadingGrid gridSize={gridSize} gridColumns={gridColumns} />
           ) : data && data.children.length > 0 ? (
             <GroupedNodeGrid
               groups={groups}
               sortMode={sortMode}
               token={token}
               gridSize={gridSize}
+              gridColumns={gridColumns}
               onOpen={(node) => (node.kind === "folder" ? openFolder(node.id) : openViewer(node))}
               selectedIds={selection.selectedIds}
               selectionMode={selection.selectionMode}
@@ -1087,7 +1732,7 @@ function FileManager({ token, onAuthExpired }: { token: string; onAuthExpired: (
               onNodeClick={selection.handleClick}
             />
           ) : (
-            <EmptyState onUpload={() => fileInput.current?.click()} onCreateFolder={() => setCreateOpen(true)} />
+            <EmptyState />
           )}
         </DropZone>
       </main>
@@ -1107,6 +1752,11 @@ function FileManager({ token, onAuthExpired }: { token: string; onAuthExpired: (
         onSubmit={submitRename}
       />
       <DeleteDialog target={deleteTarget} onOpenChange={(open) => !open && setDeleteTarget(null)} onConfirm={submitDelete} />
+      <BatchDeleteDialog
+        targets={batchDeleteNodes}
+        onOpenChange={(open) => !open && setBatchDeleteNodes([])}
+        onConfirm={() => void submitBatchDelete()}
+      />
       <FileImportDestinationDialog
         pending={pendingFileImport}
         folderName={importFolderName}
@@ -1144,6 +1794,11 @@ function FileManager({ token, onAuthExpired }: { token: string; onAuthExpired: (
         onOpenChange={(open) => !open && setShareNode(null)}
         request={request}
       />
+      <BatchShareDialog
+        files={batchShareFiles}
+        request={request}
+        onOpenChange={(open) => !open && setBatchShareFiles([])}
+      />
     </div>
   )
 }
@@ -1161,11 +1816,15 @@ function AllFilesView({ token, onAuthExpired }: { token: string; onAuthExpired: 
   const [renameTarget, setRenameTarget] = useState<NodeDto | null>(null)
   const [renameValue, setRenameValue] = useState("")
   const [deleteTarget, setDeleteTarget] = useState<NodeDto | null>(null)
+  const [batchDeleteNodes, setBatchDeleteNodes] = useState<NodeDto[]>([])
+  const [batchShareFiles, setBatchShareFiles] = useState<NodeDto[]>([])
   const [shareNode, setShareNode] = useState<NodeDto | null>(null)
   const [detailsNode, setDetailsNode] = useState<NodeDto | null>(null)
   const [viewerNode, setViewerNode] = useState<NodeDto | null>(null)
-  const request = useAuthedRequest(token, onAuthExpired)
+  const clientId = useClientId()
+  const request = useAuthedRequest(token, onAuthExpired, clientId)
   const [gridSize, setGridSize] = useGridSize()
+  const [gridColumns, setGridColumns] = useGridColumns()
 
   const fetchFiles = useCallback(
     async (nextSortMode: SortMode, nextQuery: string) => {
@@ -1201,10 +1860,6 @@ function AllFilesView({ token, onAuthExpired }: { token: string; onAuthExpired: 
     }, 280)
     return () => window.clearTimeout(timer)
   }, [navigate, query, searchValue, sortMode])
-
-  function changeSortMode(nextSortMode: SortMode) {
-    navigate(allFilesRoute(nextSortMode, query))
-  }
 
   function openViewer(node: NodeDto) {
     const params = new URLSearchParams(searchParams)
@@ -1273,8 +1928,40 @@ function AllFilesView({ token, onAuthExpired }: { token: string; onAuthExpired: 
     }
   }
 
+  async function submitBatchDelete() {
+    const targets = batchDeleteNodes
+    if (targets.length === 0) return
+
+    const targetIds = new Set(targets.map((node) => node.id))
+    let deletedCount = 0
+    let errorCount = 0
+
+    for (const target of targets) {
+      try {
+        await request<void>(`/api/nodes/${target.id}`, { method: "DELETE" })
+        deletedCount += 1
+      } catch {
+        errorCount += 1
+      }
+    }
+
+    setBatchDeleteNodes([])
+    selection.clearSelection()
+    setDetailsNode((current) => (current && targetIds.has(current.id) ? null : current))
+    setViewerNode((current) => (current && targetIds.has(current.id) ? null : current))
+    setFiles((current) => removeNodesByIds(current, targetIds))
+
+    if (deletedCount > 0) {
+      toast.success(`${deletedCount} fichier${deletedCount > 1 ? "s" : ""} supprime${deletedCount > 1 ? "s" : ""}`)
+    }
+    if (errorCount > 0) {
+      toast.error(`${errorCount} suppression${errorCount > 1 ? "s" : ""} impossible${errorCount > 1 ? "s" : ""}`)
+    }
+  }
+
   const groups = useMemo(() => groupNodesBySort(files, sortMode), [files, sortMode])
   const selection = useNodeSelection(files)
+  const selectedFiles = useMemo(() => selection.selectedNodes.filter(isFileNode), [selection.selectedNodes])
 
   useEffect(() => {
     if (!viewerId) {
@@ -1285,6 +1972,27 @@ function AllFilesView({ token, onAuthExpired }: { token: string; onAuthExpired: 
     const node = files.find((candidate) => candidate.id === viewerId)
     setViewerNode(node ?? null)
   }, [files, viewerId])
+
+  const handleRealtimeEvent = useCallback(
+    (event: RealtimeEvent) => {
+      if (event.source_client_id === clientId) return
+
+      if (event.type === "node_upsert") {
+        const node = event.node
+        setFiles((current) => reconcileAllFiles(current, node, query))
+        setDetailsNode((current) => (current?.id === node.id ? node : current))
+        setViewerNode((current) => (current?.id === node.id && node.kind === "file" ? node : current))
+        return
+      }
+
+      setFiles((current) => removeNodeById(current, event.id))
+      setDetailsNode((current) => (current?.id === event.id ? null : current))
+      setViewerNode((current) => (current?.id === event.id ? null : current))
+    },
+    [clientId, query],
+  )
+
+  useRealtimeEvents(token, clientId, handleRealtimeEvent)
 
   return (
     <div className="min-h-svh" onContextMenu={preventAppContextMenu}>
@@ -1298,24 +2006,32 @@ function AllFilesView({ token, onAuthExpired }: { token: string; onAuthExpired: 
               navigate(folderRoute(ROOT_ID, sortMode, query, "current"))
             }
           }}
-          sortMode={sortMode}
-          onSortChange={changeSortMode}
           currentLabel="Racine"
           loading={loading}
           gridSize={gridSize}
           onGridSizeChange={setGridSize}
+          gridColumns={gridColumns}
+          onGridColumnsChange={setGridColumns}
         />
 
-        <SelectionBar count={selection.selectedNodes.length} onClear={selection.clearSelection} />
+        <SelectionBar
+          count={selection.selectedNodes.length}
+          fileCount={selectedFiles.length}
+          onSelectAll={selection.selectAll}
+          onClear={selection.clearSelection}
+          onShare={() => setBatchShareFiles(selectedFiles)}
+          onDelete={() => setBatchDeleteNodes(selection.selectedNodes)}
+        />
 
         {loading ? (
-          <LoadingGrid gridSize={gridSize} />
+          <LoadingGrid gridSize={gridSize} gridColumns={gridColumns} />
         ) : files.length > 0 ? (
           <GroupedNodeGrid
             groups={groups}
             sortMode={sortMode}
             token={token}
             gridSize={gridSize}
+            gridColumns={gridColumns}
             showPath
             onOpen={openViewer}
             selectedIds={selection.selectedIds}
@@ -1348,6 +2064,11 @@ function AllFilesView({ token, onAuthExpired }: { token: string; onAuthExpired: 
         onSubmit={submitRename}
       />
       <DeleteDialog target={deleteTarget} onOpenChange={(open) => !open && setDeleteTarget(null)} onConfirm={submitDelete} />
+      <BatchDeleteDialog
+        targets={batchDeleteNodes}
+        onOpenChange={(open) => !open && setBatchDeleteNodes([])}
+        onConfirm={() => void submitBatchDelete()}
+      />
       <DetailsDialog
         token={token}
         node={detailsNode}
@@ -1370,6 +2091,11 @@ function AllFilesView({ token, onAuthExpired }: { token: string; onAuthExpired: 
         onOpenChange={(open) => !open && setShareNode(null)}
         request={request}
       />
+      <BatchShareDialog
+        files={batchShareFiles}
+        request={request}
+        onOpenChange={(open) => !open && setBatchShareFiles([])}
+      />
     </div>
   )
 }
@@ -1380,16 +2106,44 @@ function preventAppContextMenu(event: ReactMouseEvent<HTMLElement>) {
   event.preventDefault()
 }
 
-function SelectionBar({ count, onClear }: { count: number; onClear: () => void }) {
+function SelectionBar({
+  count,
+  fileCount,
+  onSelectAll,
+  onClear,
+  onShare,
+  onDelete,
+}: {
+  count: number
+  fileCount: number
+  onSelectAll: () => void
+  onClear: () => void
+  onShare: () => void
+  onDelete: () => void
+}) {
   if (count === 0) return null
 
   return (
     <div className="sticky top-[7.25rem] z-30 mb-4 flex items-center justify-between gap-3 rounded-lg border bg-background/95 px-3 py-2 shadow-sm backdrop-blur-xl sm:top-3">
       <Badge variant="default">{count} selectionne{count > 1 ? "s" : ""}</Badge>
-      <Button variant="ghost" size="icon-sm" onClick={onClear}>
-        <X />
-        <span className="sr-only">Annuler la selection</span>
-      </Button>
+      <div className="flex items-center gap-1.5">
+        <Button variant="ghost" size="icon-sm" onClick={onSelectAll}>
+          <Check />
+          <span className="sr-only">Tout selectionner</span>
+        </Button>
+        <Button variant="ghost" size="icon-sm" onClick={onShare} disabled={fileCount === 0}>
+          <Share2 />
+          <span className="sr-only">Partager les fichiers selectionnes</span>
+        </Button>
+        <Button variant="ghost" size="icon-sm" className="text-destructive hover:text-destructive" onClick={onDelete}>
+          <Trash2 />
+          <span className="sr-only">Supprimer la selection</span>
+        </Button>
+        <Button variant="ghost" size="icon-sm" onClick={onClear}>
+          <X />
+          <span className="sr-only">Annuler la selection</span>
+        </Button>
+      </div>
     </div>
   )
 }
@@ -1400,8 +2154,13 @@ function MobileActionMenu({
   actions: Array<{
     label: string
     icon: ReactNode
-    onSelect: () => void
+    onSelect?: () => void
     variant?: "default" | "outline" | "secondary"
+    fileInput?: {
+      accept: string
+      multiple?: boolean
+      onChange: (files: FileList | File[] | null) => void
+    }
   }>
 }) {
   const [open, setOpen] = useState(false)
@@ -1409,7 +2168,7 @@ function MobileActionMenu({
 
   function runAction(action: (typeof actions)[number]) {
     setPressedAction(action.label)
-    action.onSelect()
+    action.onSelect?.()
     window.setTimeout(() => {
       setOpen(false)
       setPressedAction(null)
@@ -1441,17 +2200,47 @@ function MobileActionMenu({
               {actions.map((action) => {
                 const pressed = pressedAction === action.label
                 const firstSingle = actions.length === 3 && action === actions[0]
+                const tileClassName = cn(
+                  "h-24 flex-col gap-2 rounded-2xl border px-3 text-center text-sm shadow-sm transition-all active:scale-[0.98]",
+                  "border-border bg-secondary/90 text-secondary-foreground hover:border-primary/70 hover:bg-secondary",
+                  pressed && "border-primary bg-primary text-primary-foreground shadow-lg",
+                  firstSingle && "col-span-2",
+                )
+                if (action.fileInput) {
+                  return (
+                    <label
+                      key={action.label}
+                      className={cn(
+                        tileClassName,
+                        "inline-flex cursor-pointer select-none items-center justify-center",
+                      )}
+                      onClick={() => {
+                        setPressedAction(action.label)
+                      }}
+                    >
+                      <span className="[&_svg:not([class*='size-'])]:size-6">{action.icon}</span>
+                      <span className="whitespace-normal leading-tight">{action.label}</span>
+                      <input
+                        className="sr-only"
+                        type="file"
+                        accept={action.fileInput.accept}
+                        multiple={action.fileInput.multiple}
+                        onChange={(event) => {
+                          action.fileInput?.onChange(event.target.files)
+                          event.target.value = ""
+                          setOpen(false)
+                          setPressedAction(null)
+                        }}
+                      />
+                    </label>
+                  )
+                }
                 return (
                   <Button
                     key={action.label}
                     variant="secondary"
                     size="lg"
-                    className={cn(
-                      "h-24 flex-col gap-2 rounded-2xl border px-3 text-center text-sm shadow-sm transition-all active:scale-[0.98]",
-                      "border-border bg-secondary/90 text-secondary-foreground hover:border-primary/70 hover:bg-secondary",
-                      pressed && "border-primary bg-primary text-primary-foreground shadow-lg",
-                      firstSingle && "col-span-2",
-                    )}
+                    className={tileClassName}
                     onClick={() => runAction(action)}
                   >
                     <span className="[&_svg:not([class*='size-'])]:size-6">{action.icon}</span>
@@ -1472,29 +2261,44 @@ function SearchControls({
   onValueChange,
   scope,
   onScopeChange,
-  sortMode,
-  onSortChange,
   currentLabel,
   loading,
   gridSize,
   onGridSizeChange,
+  gridColumns,
+  onGridColumnsChange,
 }: {
   value: string
   onValueChange: (value: string) => void
   scope: SearchScope
   onScopeChange: (scope: SearchScope) => void
-  sortMode: SortMode
-  onSortChange: (sortMode: SortMode) => void
   currentLabel: string
   loading: boolean
   gridSize: GridSize
   onGridSizeChange: (gridSize: GridSize) => void
+  gridColumns: number
+  onGridColumnsChange: (gridColumns: number) => void
 }) {
   const gridSizeLabel = GRID_SIZE_OPTIONS.find((option) => option.value === gridSize)?.label ?? "Moyenne"
+  const [gridColumnsValue, setGridColumnsValue] = useState(String(gridColumns))
+
+  useEffect(() => {
+    setGridColumnsValue(String(gridColumns))
+  }, [gridColumns])
+
+  function changeGridColumns(value: string) {
+    setGridColumnsValue(value)
+    if (!value.trim()) return
+
+    const parsed = Number.parseInt(value, 10)
+    if (Number.isFinite(parsed)) {
+      onGridColumnsChange(parsed)
+    }
+  }
 
   return (
     <div className="sticky top-0 z-30 -mx-4 mb-3 grid gap-2 border-b bg-background/90 px-4 pt-1 pb-2 backdrop-blur-xl sm:static sm:mx-0 sm:mb-4 sm:gap-3 sm:border-0 sm:bg-transparent sm:px-0 sm:pt-0 sm:pb-0 sm:backdrop-blur-none">
-      <div className="grid grid-cols-[1fr_auto_auto] gap-1.5 sm:gap-2">
+      <div className="grid grid-cols-[1fr_auto] gap-1.5 sm:gap-2">
         <div className="relative">
           <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
           <Input
@@ -1517,31 +2321,27 @@ function SearchControls({
             </Button>
           ) : null}
         </div>
+        <div className="hidden h-11 items-center gap-2 rounded-full border bg-background px-3 shadow-xs sm:flex">
+          <Files className="size-4 text-muted-foreground" />
+          <Label htmlFor="grid-columns" className="text-xs text-muted-foreground">
+            Colonnes
+          </Label>
+          <Input
+            id="grid-columns"
+            type="number"
+            inputMode="numeric"
+            min={MIN_GRID_COLUMNS}
+            max={MAX_GRID_COLUMNS}
+            value={gridColumnsValue}
+            onChange={(event) => changeGridColumns(event.target.value)}
+            onBlur={() => setGridColumnsValue(String(gridColumns))}
+            className="h-8 w-16 rounded-full px-2 text-center"
+          />
+        </div>
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
-            <Button variant="outline" size="icon" className="size-10 sm:h-11 sm:w-auto sm:px-3">
-              {sortMode === "date" ? <CalendarDays /> : <ArrowDownAZ />}
-              <span className="hidden sm:inline">Trier</span>
-            </Button>
-          </DropdownMenuTrigger>
-          <DropdownMenuContent align="end">
-            <DropdownMenuItem onSelect={() => onSortChange("name")}>
-              <ArrowDownAZ />
-              Nom
-              {sortMode === "name" && <Check className="ml-auto" />}
-            </DropdownMenuItem>
-            <DropdownMenuItem onSelect={() => onSortChange("date")}>
-              <CalendarDays />
-              Date
-              {sortMode === "date" && <Check className="ml-auto" />}
-            </DropdownMenuItem>
-          </DropdownMenuContent>
-        </DropdownMenu>
-        <DropdownMenu>
-          <DropdownMenuTrigger asChild>
-            <Button variant="outline" size="icon" className="size-10 sm:h-11 sm:w-auto sm:px-3">
+            <Button variant="outline" size="icon" className="size-10 sm:hidden">
               <Files />
-              <span className="hidden sm:inline">Taille</span>
               <span className="sr-only">Taille de la grille: {gridSizeLabel}</span>
             </Button>
           </DropdownMenuTrigger>
@@ -1688,35 +2488,17 @@ function DropZone({ children, onFiles }: { children: ReactNode; onFiles: (files:
   )
 }
 
-function EmptyState({ onUpload, onCreateFolder }: { onUpload: () => void; onCreateFolder: () => void }) {
+function EmptyState() {
   return (
-    <Card className="grid min-h-[46svh] place-items-center border-dashed">
-      <CardContent className="grid max-w-xs justify-items-center gap-4 text-center">
-        <div className="grid size-14 place-items-center rounded-2xl bg-muted text-muted-foreground">
-          <Folder className="size-7" />
-        </div>
-        <div className="grid gap-1">
-          <p className="font-medium">Dossier vide</p>
-          <p className="text-sm text-muted-foreground">Envoie un fichier ou cree un dossier pour commencer.</p>
-        </div>
-        <div className="flex flex-wrap justify-center gap-2">
-          <Button variant="outline" size="sm" onClick={onCreateFolder}>
-            <FolderPlus />
-            Dossier
-          </Button>
-          <Button size="sm" onClick={onUpload}>
-            <Upload />
-            Envoyer
-          </Button>
-        </div>
-      </CardContent>
-    </Card>
+    <div className="grid min-h-[46svh] place-items-center text-center text-sm font-medium text-muted-foreground">
+      Dossier vide
+    </div>
   )
 }
 
-function LoadingGrid({ gridSize }: { gridSize: GridSize }) {
+function LoadingGrid({ gridSize, gridColumns }: { gridSize: GridSize; gridColumns: number }) {
   return (
-    <section className="grid gap-2 sm:gap-3" style={galleryGridStyle(gridSize)}>
+    <section className="gallery-grid grid gap-1 sm:gap-1.5" style={galleryGridStyle(gridSize, gridColumns)}>
       {Array.from({ length: 10 }).map((_, index) => (
         <div key={index}>
           <Skeleton className="aspect-square w-full rounded-md" />
@@ -1731,6 +2513,7 @@ function GroupedNodeGrid({
   sortMode,
   token,
   gridSize,
+  gridColumns,
   showPath = false,
   onOpen,
   selectedIds,
@@ -1742,6 +2525,7 @@ function GroupedNodeGrid({
   sortMode: SortMode
   token: string
   gridSize: GridSize
+  gridColumns: number
   showPath?: boolean
   onOpen: (node: NodeDto) => void
   selectedIds?: Set<string>
@@ -1750,45 +2534,182 @@ function GroupedNodeGrid({
   onNodeClick?: (node: NodeDto, open: () => void, event: ReactMouseEvent<HTMLElement>) => void
 }) {
   let index = 0
+  const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(() => new Set())
+
+  function toggleGroup(id: string) {
+    setCollapsedGroups((current) => {
+      const next = new Set(current)
+      if (next.has(id)) {
+        next.delete(id)
+      } else {
+        next.add(id)
+      }
+      return next
+    })
+  }
 
   return (
     <section className="grid gap-5">
-      {groups.map((group) => (
-        <div key={group.id} className="grid gap-3">
-          {sortMode === "date" && (
-            <div className="sticky top-0 z-20 -mx-1 rounded-xl border bg-background/90 px-3 py-2 backdrop-blur-xl">
-              <div className="flex items-center justify-between gap-3">
-                <h2 className="text-sm font-semibold">{group.label}</h2>
-                <Badge variant="secondary">{group.nodes.length}</Badge>
-              </div>
-            </div>
-          )}
-          <div className="grid gap-2 sm:gap-3" style={galleryGridStyle(gridSize)}>
-            {group.nodes.map((node) => (
-              <NodeCard
-                key={node.id}
-                node={node}
-                token={token}
-                sortMode={sortMode}
-                showPath={showPath}
-                index={index++}
-                selected={selectedIds?.has(node.id) ?? false}
-                selectionMode={selectionMode}
-                onPointerDown={(event) => onNodePointerDown?.(node, event)}
-                onOpen={(event) => {
-                  const open = () => onOpen(node)
-                  if (onNodeClick) {
-                    onNodeClick(node, open, event)
-                  } else {
-                    open()
-                  }
-                }}
+      {groups.map((group) => {
+        const yearCollapsed = collapsedGroups.has(group.id)
+        return (
+          <div key={group.id} className="grid gap-2">
+            {sortMode === "date" && (
+              <DateGroupHeader
+                id={group.id}
+                label={group.label}
+                count={group.nodes.length}
+                collapsed={yearCollapsed}
+                level="year"
+                onToggle={toggleGroup}
               />
-            ))}
+            )}
+            {!yearCollapsed &&
+              (group.children ? (
+                <div className="grid gap-3">
+                  {group.children.map((month) => {
+                    const monthCollapsed = collapsedGroups.has(month.id)
+                    return (
+                      <div key={month.id} className="grid gap-1.5">
+                        <DateGroupHeader
+                          id={month.id}
+                          label={month.label}
+                          count={month.nodes.length}
+                          collapsed={monthCollapsed}
+                          level="month"
+                          onToggle={toggleGroup}
+                        />
+                        {!monthCollapsed && (
+                          <NodeGrid
+                            nodes={month.nodes}
+                            token={token}
+                            sortMode={sortMode}
+                            gridSize={gridSize}
+                            gridColumns={gridColumns}
+                            showPath={showPath}
+                            selectedIds={selectedIds}
+                            selectionMode={selectionMode}
+                            nextIndex={() => index++}
+                            onOpen={onOpen}
+                            onNodePointerDown={onNodePointerDown}
+                            onNodeClick={onNodeClick}
+                          />
+                        )}
+                      </div>
+                    )
+                  })}
+                </div>
+              ) : (
+                <NodeGrid
+                  nodes={group.nodes}
+                  token={token}
+                  sortMode={sortMode}
+                  gridSize={gridSize}
+                  gridColumns={gridColumns}
+                  showPath={showPath}
+                  selectedIds={selectedIds}
+                  selectionMode={selectionMode}
+                  nextIndex={() => index++}
+                  onOpen={onOpen}
+                  onNodePointerDown={onNodePointerDown}
+                  onNodeClick={onNodeClick}
+                />
+              ))}
           </div>
-        </div>
-      ))}
+        )
+      })}
     </section>
+  )
+}
+
+function DateGroupHeader({
+  id,
+  label,
+  count,
+  collapsed,
+  level,
+  onToggle,
+}: {
+  id: string
+  label: string
+  count: number
+  collapsed: boolean
+  level: "year" | "month"
+  onToggle: (id: string) => void
+}) {
+  return (
+    <button
+      type="button"
+      className={cn(
+        "sticky -mx-0.5 flex items-center justify-between gap-2 border px-2 shadow-sm backdrop-blur-md",
+        level === "year"
+          ? "top-0 z-20 rounded-lg border-border/80 bg-background/92 py-1.5"
+          : "top-8 z-10 rounded-md border-border/60 bg-muted/55 py-1",
+      )}
+      onClick={() => onToggle(id)}
+    >
+      <span className="flex min-w-0 items-center gap-1.5">
+        <ChevronRight className={cn("size-3.5 shrink-0 text-muted-foreground transition-transform", !collapsed && "rotate-90")} />
+        <span className={cn("truncate font-medium", level === "year" ? "text-xs" : "text-[11px] text-muted-foreground")}>{label}</span>
+      </span>
+      <span className="shrink-0 rounded-full bg-secondary/90 px-1.5 py-0.5 text-[10px] leading-none text-secondary-foreground">
+        {count}
+      </span>
+    </button>
+  )
+}
+
+function NodeGrid({
+  nodes,
+  token,
+  sortMode,
+  gridSize,
+  gridColumns,
+  showPath,
+  selectedIds,
+  selectionMode,
+  nextIndex,
+  onOpen,
+  onNodePointerDown,
+  onNodeClick,
+}: {
+  nodes: NodeDto[]
+  token: string
+  sortMode: SortMode
+  gridSize: GridSize
+  gridColumns: number
+  showPath: boolean
+  selectedIds?: Set<string>
+  selectionMode: boolean
+  nextIndex: () => number
+  onOpen: (node: NodeDto) => void
+  onNodePointerDown?: (node: NodeDto, event: ReactPointerEvent<HTMLElement>) => void
+  onNodeClick?: (node: NodeDto, open: () => void, event: ReactMouseEvent<HTMLElement>) => void
+}) {
+  return (
+    <div className="gallery-grid grid gap-1 sm:gap-1.5" style={galleryGridStyle(gridSize, gridColumns)}>
+      {nodes.map((node) => (
+        <NodeCard
+          key={node.id}
+          node={node}
+          token={token}
+          sortMode={sortMode}
+          showPath={showPath}
+          index={nextIndex()}
+          selected={selectedIds?.has(node.id) ?? false}
+          selectionMode={selectionMode}
+          onPointerDown={(event) => onNodePointerDown?.(node, event)}
+          onOpen={(event) => {
+            const open = () => onOpen(node)
+            if (onNodeClick) {
+              onNodeClick(node, open, event)
+            } else {
+              open()
+            }
+          }}
+        />
+      ))}
+    </div>
   )
 }
 
@@ -1820,6 +2741,7 @@ function NodeCard({
   return (
     <div
       data-node-id={node.id}
+      data-node-index={index}
       className="group relative animate-in fade-in-0 slide-in-from-bottom-2 fill-mode-both"
       style={{ animationDelay: `${Math.min(index, 12) * 35}ms` }}
     >
@@ -1838,23 +2760,26 @@ function NodeCard({
         <div
           className={cn(
             "relative grid aspect-square place-items-center overflow-hidden rounded-md transition-all",
-            isFolder ? "bg-primary/10 text-primary" : "bg-muted text-muted-foreground",
-            !isFolder && "bg-neutral-950 p-1",
+            isFolder
+              ? "bg-primary/10 text-primary"
+              : node.preview_url
+                ? "bg-transparent text-muted-foreground"
+                : "bg-muted text-muted-foreground",
             selected && "ring-primary ring-offset-background ring-[3px] ring-offset-2",
             selectionMode && !selected && "brightness-90",
           )}
         >
           {isFolder ? (
-            <div className="grid size-full place-items-center p-3 text-center">
-              <div className="grid max-w-full justify-items-center gap-2">
-                <Folder className="size-9 shrink-0" />
-                <span className="line-clamp-3 max-w-full text-sm font-medium leading-tight break-words">
+            <div className="grid size-full place-items-center p-2 text-center">
+              <div className="grid max-w-full justify-items-center gap-1.5">
+                <Folder className="size-7 shrink-0" />
+                <span className="line-clamp-3 max-w-full text-[11px] font-medium leading-[1.05] break-words sm:text-xs">
                   {node.name}
                 </span>
               </div>
             </div>
           ) : node.preview_url ? (
-            <ProtectedPreview token={token} src={node.preview_url} />
+            <ProtectedPreview token={token} src={node.preview_url} className="rounded-md" />
           ) : isImage ? (
             <Image className="size-8" />
           ) : isVideo ? (
@@ -1891,11 +2816,15 @@ function ProtectedPreview({
   src,
   fit = "cover",
   className,
+  showFallback = true,
+  onImageLoad,
 }: {
   token: string
   src: string
   fit?: "cover" | "contain"
   className?: string
+  showFallback?: boolean
+  onImageLoad?: (image: HTMLImageElement) => void
 }) {
   const [objectUrl, setObjectUrl] = useState<string | null>(null)
 
@@ -1924,7 +2853,7 @@ function ProtectedPreview({
   }, [src, token])
 
   if (!objectUrl) {
-    return <Image className={cn("size-8", className)} />
+    return showFallback ? <Image className={cn("size-8", className)} /> : null
   }
 
   return (
@@ -1934,6 +2863,7 @@ function ProtectedPreview({
       className={cn("size-full", fit === "contain" ? "object-contain" : "object-cover", className)}
       draggable={false}
       loading="lazy"
+      onLoad={(event) => onImageLoad?.(event.currentTarget)}
     />
   )
 }
@@ -2057,6 +2987,42 @@ function DeleteDialog({
   )
 }
 
+function BatchDeleteDialog({
+  targets,
+  onOpenChange,
+  onConfirm,
+}: {
+  targets: NodeDto[]
+  onOpenChange: (open: boolean) => void
+  onConfirm: () => void
+}) {
+  const fileCount = targets.filter(isFileNode).length
+  const folderCount = targets.length - fileCount
+
+  return (
+    <Dialog open={targets.length > 0} onOpenChange={onOpenChange}>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>Supprimer la selection ?</DialogTitle>
+          <DialogDescription>
+            {targets.length} element{targets.length > 1 ? "s" : ""} seront retires du stockage
+            {folderCount > 0 ? `, dont ${folderCount} dossier${folderCount > 1 ? "s" : ""}` : ""}.
+          </DialogDescription>
+        </DialogHeader>
+        <DialogFooter className="flex-col-reverse gap-2 sm:flex-row">
+          <Button variant="outline" size="lg" className="h-11 sm:h-9" onClick={() => onOpenChange(false)}>
+            Annuler
+          </Button>
+          <Button variant="destructive" size="lg" className="h-11 sm:h-9" onClick={onConfirm}>
+            <Trash2 />
+            Supprimer
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
 function FileImportDestinationDialog({
   pending,
   folderName,
@@ -2080,7 +3046,7 @@ function FileImportDestinationDialog({
         <DialogHeader>
           <DialogTitle>Destination de l'import</DialogTitle>
           <DialogDescription>
-            {count} fichier{count > 1 ? "s" : ""} selectionne{count > 1 ? "s" : ""}.
+            {count} fichier{count > 1 ? "s" : ""} selectionne{count > 1 ? "s" : ""}. Choisis ou les enregistrer pour lancer l'upload.
           </DialogDescription>
         </DialogHeader>
         <div className="grid gap-4">
@@ -2206,30 +3172,48 @@ function MediaViewer({
 
 function FullImageViewer({ token, node, src }: { token: string; node: NodeDto; src: string }) {
   const [loaded, setLoaded] = useState(false)
+  const [aspectRatio, setAspectRatio] = useState<number | null>(null)
+  const viewport = useViewportSize()
+  const frameStyle = containedMediaFrameStyle(aspectRatio, viewport)
 
   useEffect(() => {
     setLoaded(false)
+    setAspectRatio(null)
   }, [src])
 
   return (
     <div className="relative grid size-full place-items-center overflow-hidden bg-neutral-950">
-      <BlurredPreviewLayer token={token} node={node} visible={!loaded} />
-      {!loaded && (
-        <div className="absolute inset-0 z-10 grid place-items-center text-white">
-          <Loader2 className="size-8 animate-spin drop-shadow-lg" />
-        </div>
-      )}
-      <img
-        src={src}
-        alt={node.name}
-        draggable={false}
-        className={cn(
-          "relative z-20 max-h-svh max-w-screen object-contain transition-opacity duration-300",
-          loaded ? "opacity-100" : "opacity-0",
+      <div
+        className="relative grid place-items-center overflow-hidden"
+        style={frameStyle ?? fallbackMediaFrameStyle()}
+      >
+        <BlurredPreviewLayer
+          token={token}
+          node={node}
+          visible={!loaded}
+          onAspectRatio={setAspectRatio}
+        />
+        {!loaded && (
+          <div className="absolute inset-0 z-10 grid place-items-center text-white">
+            <Loader2 className="size-8 animate-spin drop-shadow-lg" />
+          </div>
         )}
-        onLoad={() => setLoaded(true)}
-        onError={() => setLoaded(true)}
-      />
+        <img
+          src={src}
+          alt={node.name}
+          draggable={false}
+          className={cn(
+            "relative z-20 size-full object-contain transition-opacity duration-300",
+            loaded ? "opacity-100" : "opacity-0",
+          )}
+          onLoad={(event) => {
+            const ratio = imageAspectRatio(event.currentTarget)
+            if (ratio) setAspectRatio(ratio)
+            setLoaded(true)
+          }}
+          onError={() => setLoaded(true)}
+        />
+      </div>
     </div>
   )
 }
@@ -2238,10 +3222,12 @@ function BlurredPreviewLayer({
   token,
   node,
   visible,
+  onAspectRatio,
 }: {
   token: string
   node: NodeDto
   visible: boolean
+  onAspectRatio?: (aspectRatio: number) => void
 }) {
   if (!node.preview_url) return null
 
@@ -2255,7 +3241,12 @@ function BlurredPreviewLayer({
       <ProtectedPreview
         token={token}
         src={node.preview_url}
-        className="scale-110 blur-2xl brightness-75 saturate-125"
+        showFallback={false}
+        className="scale-105 blur-2xl brightness-75 saturate-125"
+        onImageLoad={(image) => {
+          const ratio = imageAspectRatio(image)
+          if (ratio) onAspectRatio?.(ratio)
+        }}
       />
       <div className="absolute inset-0 bg-neutral-950/20" />
     </div>
@@ -2277,10 +3268,14 @@ function ModernVideoPlayer({ token, node, src, name }: { token: string; node: No
   const [fullscreen, setFullscreen] = useState(false)
   const [rotated, setRotated] = useState(false)
   const [videoSize, setVideoSize] = useState({ width: 0, height: 0 })
+  const [previewAspectRatio, setPreviewAspectRatio] = useState<number | null>(null)
+  const viewport = useViewportSize()
 
   const progress = duration > 0 ? (currentTime / duration) * 100 : 0
   const bufferedProgress = duration > 0 ? (buffered / duration) * 100 : 0
   const isLandscape = videoSize.width > videoSize.height
+  const videoAspectRatio = videoSize.width > 0 && videoSize.height > 0 ? videoSize.width / videoSize.height : previewAspectRatio
+  const frameStyle = rotated ? undefined : containedMediaFrameStyle(videoAspectRatio, viewport)
 
   useEffect(() => {
     setPlaying(false)
@@ -2292,6 +3287,7 @@ function ModernVideoPlayer({ token, node, src, name }: { token: string; node: No
     setControlsVisible(true)
     setRotated(false)
     setVideoSize({ width: 0, height: 0 })
+    setPreviewAspectRatio(null)
   }, [src])
 
   useEffect(() => {
@@ -2378,58 +3374,71 @@ function ModernVideoPlayer({ token, node, src, name }: { token: string; node: No
       onPointerMove={showControls}
       onPointerDown={showControls}
     >
-      <BlurredPreviewLayer token={token} node={node} visible={!mediaReady} />
-      <video
-        ref={videoRef}
-        src={src}
+      <div
         className={cn(
-          "relative z-10 object-contain transition-[opacity,transform] duration-200",
-          mediaReady ? "opacity-100" : "opacity-0",
-          rotated
-            ? "h-[100vw] max-h-none w-[100svh] max-w-none rotate-90"
-            : "max-h-svh max-w-screen",
+          "relative grid place-items-center overflow-hidden",
+          rotated && "size-full",
         )}
-        autoPlay
-        playsInline
-        preload="metadata"
-        onClick={togglePlay}
-        onDoubleClick={toggleFullscreen}
-        onLoadedMetadata={(event) => {
-          setDuration(event.currentTarget.duration || 0)
-          setVolume(event.currentTarget.volume)
-          setMuted(event.currentTarget.muted)
-          setVideoSize({
-            width: event.currentTarget.videoWidth,
-            height: event.currentTarget.videoHeight,
-          })
-          updateBuffered()
-        }}
-        onLoadedData={() => setMediaReady(true)}
-        onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime)}
-        onProgress={updateBuffered}
-        onWaiting={() => setWaiting(true)}
-        onCanPlay={() => {
-          setWaiting(false)
-          setMediaReady(true)
-        }}
-        onPlay={() => {
-          setPlaying(true)
-          setWaiting(false)
-        }}
-        onPause={() => {
-          setPlaying(false)
-          setControlsVisible(true)
-        }}
-        onEnded={() => {
-          setPlaying(false)
-          setControlsVisible(true)
-        }}
-      />
+        style={rotated ? undefined : frameStyle ?? fallbackMediaFrameStyle()}
+      >
+        <BlurredPreviewLayer
+          token={token}
+          node={node}
+          visible={!mediaReady}
+          onAspectRatio={setPreviewAspectRatio}
+        />
+        <video
+          ref={videoRef}
+          src={src}
+          className={cn(
+            "relative z-10 object-contain transition-[opacity,transform] duration-200",
+            mediaReady ? "opacity-100" : "opacity-0",
+            rotated
+              ? "h-[100vw] max-h-none w-[100svh] max-w-none rotate-90"
+              : "size-full",
+          )}
+          autoPlay
+          playsInline
+          preload="metadata"
+          onClick={togglePlay}
+          onDoubleClick={toggleFullscreen}
+          onLoadedMetadata={(event) => {
+            setDuration(event.currentTarget.duration || 0)
+            setVolume(event.currentTarget.volume)
+            setMuted(event.currentTarget.muted)
+            setVideoSize({
+              width: event.currentTarget.videoWidth,
+              height: event.currentTarget.videoHeight,
+            })
+            updateBuffered()
+          }}
+          onLoadedData={() => setMediaReady(true)}
+          onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime)}
+          onProgress={updateBuffered}
+          onWaiting={() => setWaiting(true)}
+          onCanPlay={() => {
+            setWaiting(false)
+            setMediaReady(true)
+          }}
+          onPlay={() => {
+            setPlaying(true)
+            setWaiting(false)
+          }}
+          onPause={() => {
+            setPlaying(false)
+            setControlsVisible(true)
+          }}
+          onEnded={() => {
+            setPlaying(false)
+            setControlsVisible(true)
+          }}
+        />
+      </div>
 
       {(waiting || !playing) && (
         <button
           type="button"
-          className="absolute inset-0 grid place-items-center text-white"
+          className="absolute inset-0 z-20 grid place-items-center text-white"
           onClick={togglePlay}
         >
           <span className="grid size-16 place-items-center rounded-full bg-black/55 shadow-2xl backdrop-blur-md">
@@ -2441,7 +3450,7 @@ function ModernVideoPlayer({ token, node, src, name }: { token: string; node: No
 
       <div
         className={cn(
-          "pointer-events-none absolute inset-x-0 bottom-0 grid gap-3 bg-linear-to-t from-black/85 via-black/45 to-transparent px-3 pt-16 pb-[calc(0.75rem+env(safe-area-inset-bottom))] text-white transition-opacity sm:px-5 sm:pb-5",
+          "pointer-events-none absolute inset-x-0 bottom-0 z-30 grid gap-3 bg-linear-to-t from-black/85 via-black/45 to-transparent px-3 pt-16 pb-[calc(0.75rem+env(safe-area-inset-bottom))] text-white transition-opacity sm:px-5 sm:pb-5",
           controlsVisible || !playing ? "opacity-100" : "opacity-0",
         )}
       >
@@ -2746,6 +3755,114 @@ function ShareDialog({
   )
 }
 
+function BatchShareDialog({
+  files,
+  request,
+  onOpenChange,
+}: {
+  files: NodeDto[]
+  request: <T>(path: string, init?: RequestInit) => Promise<T>
+  onOpenChange: (open: boolean) => void
+}) {
+  const [links, setLinks] = useState<BatchShareLink[]>([])
+  const [loading, setLoading] = useState(false)
+  const [copied, setCopied] = useState(false)
+
+  useEffect(() => {
+    if (files.length === 0) return
+    setLinks([])
+    setCopied(false)
+    setLoading(false)
+  }, [files])
+
+  async function copyLinks(nextLinks = links) {
+    if (nextLinks.length === 0) return
+    await navigator.clipboard?.writeText(nextLinks.map((link) => `${link.name}\n${link.url}`).join("\n\n"))
+    setCopied(true)
+    toast.success("Liens copies")
+  }
+
+  async function createLinks() {
+    if (files.length === 0) return
+    setLoading(true)
+    setCopied(false)
+
+    const nextLinks: BatchShareLink[] = []
+    let errorCount = 0
+    for (const file of files) {
+      try {
+        const payload = await request<{ public_url: string }>(`/api/files/${file.id}/shares`, { method: "POST" })
+        nextLinks.push({
+          fileId: file.id,
+          name: file.name,
+          url: toAbsoluteUrl(payload.public_url),
+        })
+      } catch {
+        errorCount += 1
+      }
+    }
+
+    setLinks(nextLinks)
+    setLoading(false)
+    if (nextLinks.length > 0) {
+      await copyLinks(nextLinks)
+    }
+    if (errorCount > 0) {
+      toast.error(`${errorCount} lien${errorCount > 1 ? "s" : ""} impossible${errorCount > 1 ? "s" : ""}`)
+    }
+  }
+
+  return (
+    <Dialog open={files.length > 0} onOpenChange={onOpenChange}>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>Partager les fichiers selectionnes</DialogTitle>
+          <DialogDescription>
+            {files.length} fichier{files.length > 1 ? "s" : ""} selectionne{files.length > 1 ? "s" : ""}. Les dossiers sont ignores.
+          </DialogDescription>
+        </DialogHeader>
+        <div className="grid gap-4">
+          <Button size="lg" className="h-11" onClick={createLinks} disabled={loading}>
+            {loading ? <Loader2 className="animate-spin" /> : <Link />}
+            Creer les liens publics
+          </Button>
+          {links.length > 0 && (
+            <>
+              <Button variant="outline" className="h-11" onClick={() => void copyLinks()}>
+                {copied ? <Check /> : <Copy />}
+                Copier tous les liens
+              </Button>
+              <Separator />
+              <div className="grid max-h-[45svh] gap-2 overflow-y-auto pr-1">
+                {links.map((link) => (
+                  <div key={link.fileId} className="grid gap-2 rounded-xl border p-3">
+                    <p className="line-clamp-2 break-all text-sm font-medium">{link.name}</p>
+                    <div className="grid grid-cols-[1fr_auto] gap-2">
+                      <Input readOnly className="h-10 min-w-0" value={link.url} />
+                      <Button
+                        variant="outline"
+                        size="icon"
+                        className="size-10"
+                        onClick={async () => {
+                          await navigator.clipboard?.writeText(link.url)
+                          toast.success("Lien copie")
+                        }}
+                      >
+                        <Copy />
+                        <span className="sr-only">Copier</span>
+                      </Button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
+        </div>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
 function SharePage({ shareToken }: { shareToken: string }) {
   const [file, setFile] = useState<NodeDto | null>(null)
   const [error, setError] = useState("")
@@ -2883,19 +4000,76 @@ function isPreviewCandidate(file: File) {
   return !!extension && MEDIA_EXTENSIONS.has(extension)
 }
 
-function uploadDisplayName(file: File) {
-  const path = importedRelativePath(file)
+function isVideoFile(file: File) {
+  const type = file.type.toLowerCase()
+  return type.startsWith("video/") || videoExtension(file.name)
+}
+
+function isVideoNode(node: NodeDto) {
+  return node.kind === "file" && !!node.mime_type?.startsWith("video/")
+}
+
+function shouldGenerateStoredVideoPreview(node: NodeDto) {
+  return isVideoNode(node) && !node.preview_url
+}
+
+function shouldUseLightImport(files: File[]) {
+  if (files.length > LIGHT_IMPORT_FILE_LIMIT) return true
+  const totalBytes = files.reduce((total, file) => total + file.size, 0)
+  if (totalBytes > LIGHT_IMPORT_BYTES_LIMIT) return true
+  return isConstrainedMobileBrowser() && files.length > 8
+}
+
+function uploadConcurrencyFor(files: File[], lightImport: boolean) {
+  if (files.length <= 1) return 1
+  if (isConstrainedMobileBrowser()) return Math.min(MOBILE_UPLOAD_CONCURRENCY, files.length)
+
+  const hasHugeFile = files.some((file) => file.size > 512 * 1024 * 1024)
+  const concurrency = hasHugeFile || lightImport ? 3 : DESKTOP_UPLOAD_CONCURRENCY
+  return Math.min(concurrency, files.length)
+}
+
+function shouldQueueClientPreview(file: File, lightImport: boolean) {
+  if (!isPreviewCandidate(file)) return false
+  if (isVideoFile(file)) return false
+  if (isConstrainedMobileBrowser()) {
+    if (file.size > 24 * 1024 * 1024) return false
+    if (lightImport && file.size > 12 * 1024 * 1024) return false
+  }
+  return true
+}
+
+function isConstrainedMobileBrowser() {
+  return /Android|Mobile|Brave/i.test(navigator.userAgent)
+}
+
+function releaseBrowserMemory(delay = 20) {
+  return new Promise<void>((resolve) => {
+    window.setTimeout(resolve, delay)
+  })
+}
+
+function uploadDisplayName(file: File, strippedRoot = "") {
+  const path = importedPathParts(file, strippedRoot).join("/")
   return path && path !== file.name ? path : file.name
 }
 
-function importFolderSegments(file: File) {
-  const parts = importedRelativePath(file).split("/").filter(Boolean)
+function importFolderSegments(file: File, strippedRoot = "") {
+  const parts = importedPathParts(file, strippedRoot)
   parts.pop()
   return parts.map((segment) => segment.trim()).filter(isSafeImportSegment)
 }
 
 function importedRelativePath(file: File) {
   return ((file as FileWithPath).webkitRelativePath || file.name).replaceAll("\\", "/")
+}
+
+function importedPathParts(file: File, strippedRoot = "") {
+  const parts = importedRelativePath(file).split("/").filter(Boolean)
+  if (strippedRoot && parts.length > 1 && parts[0] === strippedRoot) {
+    return parts.slice(1)
+  }
+  return parts
 }
 
 function defaultImportFolderName(files: File[], suggestedFolderName?: string) {
@@ -2919,7 +4093,10 @@ function defaultImportFolderName(files: File[], suggestedFolderName?: string) {
 function commonImportedRoot(files: File[]) {
   if (files.length === 0) return ""
   const roots = files
-    .map((file) => importedRelativePath(file).split("/").filter(Boolean)[0] ?? "")
+    .map((file) => {
+      const parts = importedPathParts(file)
+      return parts.length > 1 ? (parts[0] ?? "") : ""
+    })
     .filter(Boolean)
   if (roots.length !== files.length) return ""
   const first = roots[0]
@@ -2984,6 +4161,7 @@ async function ensureFolderPath(
   rootId: string,
   segments: string[],
   cache: Map<string, string>,
+  onFolderReady?: (folder: NodeDto) => void,
 ) {
   let parentId = rootId
 
@@ -3000,6 +4178,7 @@ async function ensureFolderPath(
         method: "POST",
         body: JSON.stringify({ name: segment }),
       })
+      onFolderReady?.(created)
       parentId = created.id
     } catch (error) {
       const payload = await request<FolderResponse>(`/api/folders/${parentId}?sort=name`)
@@ -3017,6 +4196,7 @@ async function ensureFolderPath(
 async function uploadFileWithConflictHandling({
   request,
   token,
+  clientId,
   folderId,
   file,
   onProgress,
@@ -3024,6 +4204,7 @@ async function uploadFileWithConflictHandling({
 }: {
   request: <T>(path: string, init?: RequestInit) => Promise<T>
   token: string
+  clientId: string
   folderId: string
   file: File
   onProgress: (progress: number) => void
@@ -3033,7 +4214,7 @@ async function uploadFileWithConflictHandling({
 
   for (;;) {
     try {
-      return await uploadRawFile(token, folderId, file, onProgress, uploadName)
+      return await uploadRawFile(token, clientId, folderId, file, onProgress, uploadName)
     } catch (err) {
       if (!isConflictError(err)) throw err
 
@@ -3053,7 +4234,7 @@ async function uploadFileWithConflictHandling({
         throw new Error("Un dossier porte deja ce nom.")
       }
 
-      return await replaceRawFile(token, existing.id, file, onProgress)
+      return await replaceRawFile(token, clientId, existing.id, file, onProgress)
     }
   }
 }
@@ -3106,6 +4287,7 @@ function isConflictError(err: unknown) {
 
 function uploadRawFile(
   token: string,
+  clientId: string,
   folderId: string,
   file: File,
   onProgress: (progress: number) => void,
@@ -3119,6 +4301,7 @@ function uploadRawFile(
     })
     xhr.open("POST", `/api/folders/${folderId}/files?${params}`)
     xhr.setRequestHeader("Authorization", `Bearer ${token}`)
+    xhr.setRequestHeader("X-NAS-Client-ID", clientId)
     if (file.type) xhr.setRequestHeader("Content-Type", file.type)
     xhr.upload.onprogress = (event) => {
       if (event.lengthComputable) {
@@ -3139,6 +4322,7 @@ function uploadRawFile(
 
 function replaceRawFile(
   token: string,
+  clientId: string,
   fileId: string,
   file: File,
   onProgress: (progress: number) => void,
@@ -3150,6 +4334,7 @@ function replaceRawFile(
     })
     xhr.open("PUT", `/api/files/${fileId}?${params}`)
     xhr.setRequestHeader("Authorization", `Bearer ${token}`)
+    xhr.setRequestHeader("X-NAS-Client-ID", clientId)
     if (file.type) xhr.setRequestHeader("Content-Type", file.type)
     xhr.upload.onprogress = (event) => {
       if (event.lengthComputable) {
@@ -3177,14 +4362,26 @@ function parseUploadError(value: string) {
   }
 }
 
-async function uploadClientPreview(token: string, fileId: string, file: File) {
+async function uploadClientPreview(token: string, clientId: string, fileId: string, file: File) {
   const preview = await createThumbnail(file)
-  if (!preview) return
+  if (!preview) return null
 
+  return uploadPreviewBlob(token, clientId, fileId, preview)
+}
+
+async function uploadStoredVideoPreview(token: string, clientId: string, node: NodeDto) {
+  const preview = await createVideoThumbnailFromSource(mediaInlineUrl(token, node))
+  if (!preview) return null
+
+  return uploadPreviewBlob(token, clientId, node.id, preview)
+}
+
+async function uploadPreviewBlob(token: string, clientId: string, fileId: string, preview: Blob) {
   const response = await fetch(`/api/files/${fileId}/preview`, {
     method: "PUT",
     headers: {
       Authorization: `Bearer ${token}`,
+      "X-NAS-Client-ID": clientId,
       "Content-Type": preview.type,
     },
     body: preview,
@@ -3193,6 +4390,8 @@ async function uploadClientPreview(token: string, fileId: string, file: File) {
   if (!response.ok) {
     throw new Error(await readError(response))
   }
+
+  return (await response.json()) as NodeDto
 }
 
 async function createThumbnail(file: File) {
@@ -3204,39 +4403,53 @@ async function createThumbnail(file: File) {
     return null
   }
 
+  let bitmap: ImageBitmap | null = null
+  let canvas: HTMLCanvasElement | null = null
   try {
-    const bitmap = await createImageBitmap(file, { imageOrientation: "from-image" })
+    bitmap = await createImageBitmap(file, { imageOrientation: "from-image" })
     const maxSize = 360
     const ratio = Math.min(1, maxSize / Math.max(bitmap.width, bitmap.height))
     const width = Math.max(1, Math.round(bitmap.width * ratio))
     const height = Math.max(1, Math.round(bitmap.height * ratio))
-    const canvas = document.createElement("canvas")
+    canvas = document.createElement("canvas")
     canvas.width = width
     canvas.height = height
     const context = canvas.getContext("2d")
     if (!context) return null
     context.drawImage(bitmap, 0, 0, width, height)
-    bitmap.close()
+    const outputCanvas = canvas
 
-    return await new Promise<Blob | null>((resolve) => {
-      canvas.toBlob((blob) => resolve(blob), "image/webp", 0.75)
-    })
+    return await canvasToPreviewBlob(outputCanvas, 0.75)
   } catch {
     return null
+  } finally {
+    bitmap?.close()
+    if (canvas) {
+      canvas.width = 1
+      canvas.height = 1
+    }
   }
 }
 
 async function createVideoThumbnail(file: File) {
+  const objectUrl = URL.createObjectURL(file)
+  return createVideoThumbnailFromSource(objectUrl, () => URL.revokeObjectURL(objectUrl))
+}
+
+async function createVideoThumbnailFromSource(source: string, disposeSource?: () => void) {
   return new Promise<Blob | null>((resolve) => {
     const video = document.createElement("video")
-    const objectUrl = URL.createObjectURL(file)
     let settled = false
+    let seekTimer = 0
     const timer = window.setTimeout(() => fail(), 8000)
     const cleanup = () => {
       window.clearTimeout(timer)
+      window.clearTimeout(seekTimer)
+      video.pause()
       video.removeAttribute("src")
       video.load()
-      URL.revokeObjectURL(objectUrl)
+      video.remove()
+      disposeSource?.()
     }
     const fail = () => {
       if (settled) return
@@ -3266,40 +4479,67 @@ async function createVideoThumbnail(file: File) {
         }
 
         context.drawImage(video, 0, 0, canvas.width, canvas.height)
-        canvas.toBlob(
-          (blob) => {
-            if (settled) return
-            settled = true
-            cleanup()
-            resolve(blob)
-          },
-          "image/webp",
-          0.76,
-        )
+        void canvasToPreviewBlob(canvas, 0.76).then((blob) => {
+          if (settled) return
+          settled = true
+          canvas.width = 1
+          canvas.height = 1
+          cleanup()
+          resolve(blob)
+        })
       } catch {
         fail()
       }
     }
+    const captureWhenReady = () => {
+      if (video.readyState >= 2) {
+        capture()
+      }
+    }
 
-    video.preload = "metadata"
+    video.preload = "auto"
     video.muted = true
     video.playsInline = true
     video.onerror = fail
+    video.onloadeddata = captureWhenReady
     video.onloadedmetadata = () => {
       const duration = Number.isFinite(video.duration) ? video.duration : 0
       const target = duration > 0.25 ? Math.min(Math.max(duration * 0.08, 0.1), 1.5, duration - 0.05) : 0
       if (target > 0) {
         try {
+          seekTimer = window.setTimeout(captureWhenReady, 1800)
           video.currentTime = target
         } catch {
-          capture()
+          captureWhenReady()
         }
       } else {
-        capture()
+        captureWhenReady()
       }
     }
-    video.onseeked = capture
-    video.src = objectUrl
+    video.onseeked = () => {
+      window.clearTimeout(seekTimer)
+      captureWhenReady()
+    }
+    video.style.position = "fixed"
+    video.style.left = "-9999px"
+    video.style.top = "0"
+    video.style.width = "1px"
+    video.style.height = "1px"
+    video.style.opacity = "0"
+    video.style.pointerEvents = "none"
+    video.src = source
+    document.body.appendChild(video)
+    video.load()
+  })
+}
+
+async function canvasToPreviewBlob(canvas: HTMLCanvasElement, quality: number) {
+  return (await canvasToBlob(canvas, "image/webp", quality)) ?? (await canvasToBlob(canvas, "image/jpeg", quality))
+}
+
+function canvasToBlob(canvas: HTMLCanvasElement, type: string, quality: number) {
+  return new Promise<Blob | null>((resolve) => {
+    canvas.toBlob((blob) => resolve(blob), type, quality)
   })
 }
 
@@ -3349,28 +4589,128 @@ async function readError(response: Response) {
 
 function groupNodesBySort(nodes: NodeDto[], sortMode: SortMode): NodeGroup[] {
   if (sortMode === "name") {
-    return [{ id: "all", label: "Tous", nodes }]
+    return [{ id: "all", label: "Tous", nodes: sortNodesForMode(nodes, sortMode) }]
   }
 
-  const groups = new Map<string, NodeGroup>()
-  const sortedNodes = [...nodes].sort((left, right) => {
-    const byDate = right.display_date_at - left.display_date_at
-    if (byDate !== 0) return byDate
-    return left.name.localeCompare(right.name, "fr", { sensitivity: "base" })
-  })
+  const years = new Map<string, NodeGroup>()
+  const monthsByYear = new Map<string, Map<string, NodeGroup>>()
+  const sortedNodes = sortNodesForMode(nodes, sortMode)
 
   for (const node of sortedNodes) {
-    const key = monthKey(node.display_date_at)
-    const group = groups.get(key) ?? {
-      id: key,
+    const yearId = yearKey(node.display_date_at)
+    const year = years.get(yearId) ?? {
+      id: yearId,
+      label: yearLabel(node.display_date_at),
+      nodes: [],
+      children: [],
+    }
+    year.nodes.push(node)
+    years.set(yearId, year)
+
+    let monthGroups = monthsByYear.get(yearId)
+    if (!monthGroups) {
+      monthGroups = new Map<string, NodeGroup>()
+      monthsByYear.set(yearId, monthGroups)
+    }
+
+    const monthId = monthKey(node.display_date_at)
+    const month = monthGroups.get(monthId) ?? {
+      id: monthId,
       label: monthLabel(node.display_date_at),
       nodes: [],
     }
-    group.nodes.push(node)
-    groups.set(key, group)
+    month.nodes.push(node)
+    monthGroups.set(monthId, month)
+    year.children = Array.from(monthGroups.values())
   }
 
-  return Array.from(groups.values())
+  return Array.from(years.values())
+}
+
+function upsertNode(nodes: NodeDto[], node: NodeDto) {
+  const index = nodes.findIndex((candidate) => candidate.id === node.id)
+  if (index === -1) return [...nodes, node]
+
+  const next = [...nodes]
+  next[index] = node
+  return next
+}
+
+function removeNodeById(nodes: NodeDto[], id: string) {
+  const next = nodes.filter((node) => node.id !== id)
+  return next.length === nodes.length ? nodes : next
+}
+
+function removeNodesByIds(nodes: NodeDto[], ids: Set<string>) {
+  const next = nodes.filter((node) => !ids.has(node.id))
+  return next.length === nodes.length ? nodes : next
+}
+
+function isFileNode(node: NodeDto) {
+  return node.kind === "file"
+}
+
+function reconcileNodeChildren(nodes: NodeDto[], node: NodeDto, parentId: string, sortMode: SortMode) {
+  const alreadyVisible = nodes.some((candidate) => candidate.id === node.id)
+  if (node.parent_id === parentId) {
+    return sortNodesForMode(upsertNode(nodes, node), sortMode)
+  }
+  return alreadyVisible ? removeNodeById(nodes, node.id) : nodes
+}
+
+function reconcileSearchNodes(
+  nodes: NodeDto[],
+  node: NodeDto,
+  query: string,
+  scope: SearchScope,
+  currentFolder: NodeDto | null,
+  sortMode: SortMode,
+) {
+  const alreadyVisible = nodes.some((candidate) => candidate.id === node.id)
+  if (nodeMatchesSearch(node, query) && nodeInSearchScope(node, scope, currentFolder)) {
+    return sortNodesForMode(upsertNode(nodes, node), sortMode)
+  }
+  return alreadyVisible ? removeNodeById(nodes, node.id) : nodes
+}
+
+function reconcileAllFiles(nodes: NodeDto[], node: NodeDto, query: string) {
+  const alreadyVisible = nodes.some((candidate) => candidate.id === node.id)
+  if (node.kind === "file" && nodeMatchesSearch(node, query)) {
+    return upsertNode(nodes, node)
+  }
+  return alreadyVisible ? removeNodeById(nodes, node.id) : nodes
+}
+
+function nodeMatchesSearch(node: NodeDto, query: string) {
+  const search = query.trim().toLowerCase()
+  if (!search) return true
+  return node.name.toLowerCase().includes(search) || node.relative_path.toLowerCase().includes(search)
+}
+
+function nodeInSearchScope(node: NodeDto, scope: SearchScope, currentFolder: NodeDto | null) {
+  if (scope === "all") return true
+  if (!currentFolder) return false
+  if (currentFolder.id === ROOT_ID || !currentFolder.relative_path) return true
+  const prefix = `${currentFolder.relative_path}/`
+  return node.relative_path === currentFolder.relative_path || node.relative_path.startsWith(prefix)
+}
+
+function sortNodesForMode(nodes: NodeDto[], sortMode: SortMode) {
+  return [...nodes].sort((left, right) => {
+    if (sortMode === "date") {
+      const byDate = right.display_date_at - left.display_date_at
+      if (byDate !== 0) return byDate
+    } else {
+      const byKind = kindOrder(left) - kindOrder(right)
+      if (byKind !== 0) return byKind
+    }
+
+    return left.name.localeCompare(right.name, "fr", { sensitivity: "base" })
+  })
+}
+
+function kindOrder(node: NodeDto) {
+  return node.kind === "folder" ? 0 : 1
 }
 
 function monthKey(timestamp: number) {
@@ -3378,10 +4718,17 @@ function monthKey(timestamp: number) {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}`
 }
 
+function yearKey(timestamp: number) {
+  return `year-${new Date(timestamp * 1000).getFullYear()}`
+}
+
+function yearLabel(timestamp: number) {
+  return String(new Date(timestamp * 1000).getFullYear())
+}
+
 function monthLabel(timestamp: number) {
   return capitalizeFirstLetter(new Intl.DateTimeFormat("fr-FR", {
     month: "long",
-    year: "numeric",
   }).format(new Date(timestamp * 1000)))
 }
 
@@ -3435,10 +4782,72 @@ function parentPathLabel(relativePath: string) {
   return parts.length > 0 ? parts.join(" / ") : "Racine"
 }
 
-function galleryGridStyle(gridSize: GridSize) {
-  const min = GRID_SIZE_OPTIONS.find((option) => option.value === gridSize)?.min ?? 170
+function useViewportSize() {
+  const [size, setSize] = useState(currentViewportSize)
+
+  useEffect(() => {
+    const update = () => setSize(currentViewportSize())
+    window.addEventListener("resize", update)
+    window.addEventListener("orientationchange", update)
+    window.visualViewport?.addEventListener("resize", update)
+    window.visualViewport?.addEventListener("scroll", update)
+    return () => {
+      window.removeEventListener("resize", update)
+      window.removeEventListener("orientationchange", update)
+      window.visualViewport?.removeEventListener("resize", update)
+      window.visualViewport?.removeEventListener("scroll", update)
+    }
+  }, [])
+
+  return size
+}
+
+function currentViewportSize() {
   return {
-    gridTemplateColumns: `repeat(auto-fill, minmax(min(100%, ${min}px), 1fr))`,
+    width: window.visualViewport?.width ?? window.innerWidth,
+    height: window.visualViewport?.height ?? window.innerHeight,
+  }
+}
+
+function containedMediaFrameStyle(
+  aspectRatio: number | null,
+  viewport: { width: number; height: number },
+) {
+  if (!aspectRatio || !Number.isFinite(aspectRatio) || aspectRatio <= 0 || viewport.width <= 0 || viewport.height <= 0) {
+    return undefined
+  }
+
+  let width = viewport.width
+  let height = width / aspectRatio
+  if (height > viewport.height) {
+    height = viewport.height
+    width = height * aspectRatio
+  }
+
+  return {
+    width: `${Math.round(width)}px`,
+    height: `${Math.round(height)}px`,
+  }
+}
+
+function fallbackMediaFrameStyle() {
+  return {
+    width: "min(70vw, 70svh)",
+    height: "min(70vw, 70svh)",
+  }
+}
+
+function imageAspectRatio(image: HTMLImageElement) {
+  const width = image.naturalWidth
+  const height = image.naturalHeight
+  return width > 0 && height > 0 ? width / height : null
+}
+
+function galleryGridStyle(gridSize: GridSize, gridColumns: number): GalleryGridStyle {
+  const mobileColumns = GRID_SIZE_OPTIONS.find((option) => option.value === gridSize)?.columns ?? 3
+  return {
+    "--gallery-mobile-columns": mobileColumns,
+    "--gallery-desktop-columns": clampGridColumns(gridColumns),
   }
 }
 

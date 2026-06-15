@@ -138,8 +138,10 @@
       linear-gradient(180deg, color-mix(in oklch, var(--muted) 62%, transparent), var(--background) 24rem);
   }
 
+  html.is-selecting-nodes,
   body.is-selecting-nodes {
     cursor: crosshair;
+    overscroll-behavior: contain;
     touch-action: none;
   }
 
@@ -155,6 +157,16 @@
     -webkit-user-drag: none;
     -webkit-user-select: none;
     user-select: none;
+  }
+
+  .gallery-grid {
+    grid-template-columns: repeat(var(--gallery-mobile-columns, 3), minmax(0, 1fr));
+  }
+
+  @media (min-width: 640px) {
+    .gallery-grid {
+      grid-template-columns: repeat(var(--gallery-desktop-columns, 5), minmax(0, 1fr));
+    }
   }
 
   .video-range {

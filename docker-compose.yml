@@ -1,0 +1,36 @@
+services:
+  nas:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      NAS_LOGIN_PASSWORD: ${NAS_LOGIN_PASSWORD:-change-me-please}
+      NAS_BIND: 0.0.0.0:3000
+      NAS_DATA_DIR: /data
+      NAS_SESSION_TTL_HOURS: ${NAS_SESSION_TTL_HOURS:-12}
+      NAS_PUBLIC_BASE_URL: ${NAS_PUBLIC_BASE_URL:-}
+      NAS_TRUST_PROXY_HEADERS: "true"
+    volumes:
+      - nas-data:/data
+    expose:
+      - "3000"
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      - nas
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./certs:/certs:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+volumes:
+  nas-data:
+  caddy-data:
+  caddy-config:

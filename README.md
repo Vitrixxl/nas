@@ -28,6 +28,43 @@ cargo run
 
 Puis ouvrir `http://127.0.0.1:3000`.
 
+## Lancer avec Docker + Caddy HTTPS
+
+Créer la configuration :
+
+```sh
+cp .env.example .env
+```
+
+Dans `.env`, remplacer `NAS_PUBLIC_BASE_URL` par l'adresse HTTPS a utiliser depuis le telephone :
+
+```sh
+NAS_LOGIN_PASSWORD=change-me-please
+NAS_PUBLIC_BASE_URL=https://192.168.1.42
+```
+
+Generer ensuite le certificat autosigne pour l'IP LAN :
+
+```sh
+./scripts/generate-self-signed-cert.sh 192.168.1.42
+```
+
+Puis lancer :
+
+```sh
+docker compose up --build -d
+```
+
+Ouvrir ensuite `https://192.168.1.42` depuis Android.
+
+La configuration Caddy utilise `certs/nas.crt` et `certs/nas.key`. Pour que le navigateur Android considere vraiment la page comme sure, transferer `certs/nas.crt` sur Android puis l'installer comme certificat CA utilisateur. Sans certificat de confiance, Android peut afficher une alerte HTTPS et certaines APIs "secure context" peuvent rester bloquees.
+
+Pour arreter :
+
+```sh
+docker compose down
+```
+
 ## Stockage
 
 - `data/files` contient l'arborescence reelle des dossiers et fichiers.
