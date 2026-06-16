@@ -2429,8 +2429,8 @@ function DropZone({ children, onFiles }: { children: ReactNode; onFiles: (files:
 
 function EmptyState() {
   return (
-    <div className="grid min-h-[46svh] place-items-center text-center">
-      <div className="grid justify-items-center gap-4 rounded-2xl border border-dashed border-border bg-card px-10 py-12 text-sm font-medium text-muted-foreground shadow-sm">
+    <div className="grid min-h-[calc(100svh-14rem)] place-items-center text-center sm:min-h-[calc(100svh-16rem)]">
+      <div className="grid justify-items-center gap-4 text-sm font-medium text-muted-foreground">
         <span className="grid size-16 place-items-center rounded-full bg-secondary text-secondary-foreground">
           <Folder className="size-8" />
         </span>
