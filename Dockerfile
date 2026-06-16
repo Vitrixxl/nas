@@ -29,6 +29,7 @@ COPY --from=web-builder /app/web/dist ./web/dist
 
 ENV NAS_BIND=0.0.0.0:3000
 ENV NAS_DATA_DIR=/data
+ENV NAS_FILES_DIR=/data/files
 ENV NAS_SESSION_TTL_HOURS=12
 
 VOLUME ["/data"]

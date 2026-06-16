@@ -10,6 +10,8 @@ Variables utiles :
 export NAS_LOGIN_PASSWORD="change-me-please"
 export NAS_BIND="127.0.0.1:3000"
 export NAS_DATA_DIR="./data"
+# Optionnel : chemin des medias originaux. Par defaut: "$NAS_DATA_DIR/files".
+export NAS_FILES_DIR="./data/files"
 export NAS_SESSION_TTL_HOURS="12"
 # export NAS_PUBLIC_BASE_URL="https://nas.example.com"
 ```
@@ -41,8 +43,11 @@ Dans `.env`, remplacer `NAS_PUBLIC_BASE_URL` par l'adresse HTTPS a utiliser depu
 
 ```sh
 NAS_LOGIN_PASSWORD=change-me-please
+NAS_FILES_DIR=/data/files
 NAS_PUBLIC_BASE_URL=https://192.168.1.42
 ```
+
+`NAS_FILES_DIR` peut pointer ailleurs si tu veux separer les medias originaux du reste des donnees. Avec Docker, si tu mets un chemin hors de `/data`, ajoute aussi un volume correspondant dans `docker-compose.yml`.
 
 Generer ensuite le certificat autosigne pour l'IP LAN :
 
@@ -68,7 +73,7 @@ docker compose down
 
 ## Stockage
 
-- `data/files` contient l'arborescence reelle des dossiers et fichiers.
+- `NAS_FILES_DIR` contient l'arborescence reelle des dossiers et fichiers (`data/files` par defaut).
 - `data/preview` contient les thumbnails generees cote client.
 - `data/tmp` contient les fichiers `.part` pendant les uploads streamés.
 - `data/nas.sqlite` indexe les ids, chemins, metadonnees, sessions et partages.

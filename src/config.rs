@@ -24,6 +24,12 @@ impl Config {
             .context("NAS_BIND must be a valid socket address")?;
 
         let data_dir = PathBuf::from(env::var("NAS_DATA_DIR").unwrap_or_else(|_| "data".into()));
+        let files_dir = env::var("NAS_FILES_DIR")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| data_dir.join("files"));
         let login_password = env::var("NAS_LOGIN_PASSWORD")
             .context("NAS_LOGIN_PASSWORD is required to start the server")?;
 
@@ -49,7 +55,7 @@ impl Config {
 
         Ok(Self {
             bind,
-            files_dir: data_dir.join("files"),
+            files_dir,
             preview_dir: data_dir.join("preview"),
             tmp_dir: data_dir.join("tmp"),
             trash_dir: data_dir.join("trash"),
