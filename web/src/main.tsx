@@ -1071,9 +1071,18 @@ function FileManager({ onAuthExpired }: { onAuthExpired: () => void }) {
 
     try {
       await request<void>(`/api/nodes/${target.id}`, { method: "DELETE" })
+      const deletedIds = new Set([target.id])
+      const replacementViewerNode =
+        viewerNode?.id === target.id ? replacementMediaNodeAfterDelete(mediaNodes, deletedIds, target.id) : null
       setDeleteTarget(null)
       setDetailsNode((current) => (current?.id === target.id ? null : current))
-      setViewerNode((current) => (current?.id === target.id ? null : current))
+      if (viewerNode?.id === target.id) {
+        if (replacementViewerNode) openViewer(replacementViewerNode, true)
+        else {
+          setViewerNode(null)
+          closeViewer()
+        }
+      }
       toast.success(target.kind === "folder" ? "Dossier supprime" : "Fichier supprime")
       await fetchFolder(routeFolderId, sortMode, mediaFilter)
     } catch (err) {
@@ -1085,25 +1094,37 @@ function FileManager({ onAuthExpired }: { onAuthExpired: () => void }) {
     const targets = batchDeleteNodes
     if (targets.length === 0) return
 
-    const targetIds = new Set(targets.map((node) => node.id))
+    const deletedIds = new Set<string>()
     let deletedCount = 0
     let errorCount = 0
 
     for (const target of targets) {
       try {
         await request<void>(`/api/nodes/${target.id}`, { method: "DELETE" })
+        deletedIds.add(target.id)
         deletedCount += 1
       } catch {
         errorCount += 1
       }
     }
 
+    const replacementViewerNode =
+      viewerNode && deletedIds.has(viewerNode.id)
+        ? replacementMediaNodeAfterDelete(mediaNodes, deletedIds, viewerNode.id)
+        : null
+
     setBatchDeleteNodes([])
     selection.clearSelection()
-    setDetailsNode((current) => (current && targetIds.has(current.id) ? null : current))
-    setViewerNode((current) => (current && targetIds.has(current.id) ? null : current))
-    setData((current) => current ? { ...current, children: removeNodesByIds(current.children, targetIds) } : current)
-    setSearchResults((current) => removeNodesByIds(current, targetIds))
+    setDetailsNode((current) => (current && deletedIds.has(current.id) ? null : current))
+    if (viewerNode && deletedIds.has(viewerNode.id)) {
+      if (replacementViewerNode) openViewer(replacementViewerNode, true)
+      else {
+        setViewerNode(null)
+        closeViewer()
+      }
+    }
+    setData((current) => current ? { ...current, children: removeNodesByIds(current.children, deletedIds) } : current)
+    setSearchResults((current) => removeNodesByIds(current, deletedIds))
 
     if (deletedCount > 0) {
       toast.success(`${deletedCount} element${deletedCount > 1 ? "s" : ""} supprime${deletedCount > 1 ? "s" : ""}`)
@@ -1761,9 +1782,18 @@ function AllFilesView({ onAuthExpired }: { onAuthExpired: () => void }) {
 
     try {
       await request<void>(`/api/nodes/${target.id}`, { method: "DELETE" })
+      const deletedIds = new Set([target.id])
+      const replacementViewerNode =
+        viewerNode?.id === target.id ? replacementMediaNodeAfterDelete(mediaNodes, deletedIds, target.id) : null
       setDeleteTarget(null)
       setDetailsNode((current) => (current?.id === target.id ? null : current))
-      setViewerNode((current) => (current?.id === target.id ? null : current))
+      if (viewerNode?.id === target.id) {
+        if (replacementViewerNode) openViewer(replacementViewerNode, true)
+        else {
+          setViewerNode(null)
+          closeViewer()
+        }
+      }
       toast.success("Fichier supprime")
       await fetchFiles(sortMode, query, mediaFilter)
     } catch (err) {
@@ -1775,24 +1805,36 @@ function AllFilesView({ onAuthExpired }: { onAuthExpired: () => void }) {
     const targets = batchDeleteNodes
     if (targets.length === 0) return
 
-    const targetIds = new Set(targets.map((node) => node.id))
+    const deletedIds = new Set<string>()
     let deletedCount = 0
     let errorCount = 0
 
     for (const target of targets) {
       try {
         await request<void>(`/api/nodes/${target.id}`, { method: "DELETE" })
+        deletedIds.add(target.id)
         deletedCount += 1
       } catch {
         errorCount += 1
       }
     }
 
+    const replacementViewerNode =
+      viewerNode && deletedIds.has(viewerNode.id)
+        ? replacementMediaNodeAfterDelete(mediaNodes, deletedIds, viewerNode.id)
+        : null
+
     setBatchDeleteNodes([])
     selection.clearSelection()
-    setDetailsNode((current) => (current && targetIds.has(current.id) ? null : current))
-    setViewerNode((current) => (current && targetIds.has(current.id) ? null : current))
-    setFiles((current) => removeNodesByIds(current, targetIds))
+    setDetailsNode((current) => (current && deletedIds.has(current.id) ? null : current))
+    if (viewerNode && deletedIds.has(viewerNode.id)) {
+      if (replacementViewerNode) openViewer(replacementViewerNode, true)
+      else {
+        setViewerNode(null)
+        closeViewer()
+      }
+    }
+    setFiles((current) => removeNodesByIds(current, deletedIds))
 
     if (deletedCount > 0) {
       toast.success(`${deletedCount} fichier${deletedCount > 1 ? "s" : ""} supprime${deletedCount > 1 ? "s" : ""}`)
@@ -3083,40 +3125,92 @@ function DuplicateConflictDialog({
   )
 }
 
-/** Precharge le media plein voisin pour que l'atterrissage apres swipe soit instantane. */
-function MediaPrefetch({ node }: { node: NodeDto }) {
-  const src = mediaInlineUrl(node)
-  if (node.mime_type?.startsWith("video/")) {
-    return <video src={src} preload="auto" muted tabIndex={-1} aria-hidden className="size-0" />
+const FULL_IMAGE_MAX_RETRIES = 3
+
+function ThumbnailBackdrop({
+  thumbnailSrc,
+  icon,
+}: {
+  thumbnailSrc: string | null
+  icon: ReactNode
+}) {
+  if (!thumbnailSrc) {
+    return <div className="absolute inset-0 grid place-items-center text-muted-foreground">{icon}</div>
   }
-  return <img src={src} alt="" tabIndex={-1} aria-hidden className="size-0" />
+
+  return (
+    <>
+      <img
+        src={thumbnailSrc}
+        alt=""
+        aria-hidden
+        draggable={false}
+        className="absolute inset-0 size-full object-contain brightness-75 saturate-125"
+      />
+      <div className="absolute inset-0 bg-background/30" />
+    </>
+  )
 }
 
-/** Slot voisin du carrousel : miniature floue agrandie + miniature nette contenue, affichee sans charger le plein. */
-function MediaPreviewSlide({ node }: { node: NodeDto }) {
+function CarouselImageSlide({
+  thumbnailSrc,
+  fullSrc,
+  alt,
+}: {
+  thumbnailSrc: string | null
+  fullSrc: string
+  alt: string
+}) {
+  const [loaded, setLoaded] = useState(false)
+  const [attempt, setAttempt] = useState(0)
+
+  useEffect(() => {
+    setLoaded(false)
+    setAttempt(0)
+  }, [fullSrc])
+
+  const retrySrc = attempt === 0 ? fullSrc : `${fullSrc}${fullSrc.includes("?") ? "&" : "?"}retry=${attempt}`
+
+  return (
+    <div className="relative size-full overflow-hidden bg-background">
+      <ThumbnailBackdrop thumbnailSrc={thumbnailSrc} icon={<Image className="size-12" />} />
+      {!loaded && (
+        <img
+          src={retrySrc}
+          alt=""
+          aria-hidden
+          draggable={false}
+          decoding="async"
+          loading="eager"
+          className="pointer-events-none absolute inset-0 size-full object-contain opacity-0"
+          onLoad={() => setLoaded(true)}
+          onError={() => {
+            if (attempt < FULL_IMAGE_MAX_RETRIES) {
+              window.setTimeout(() => setAttempt((value) => value + 1), 600)
+            }
+          }}
+        />
+      )}
+      {loaded && (
+        <img
+          src={retrySrc}
+          alt={alt}
+          draggable={false}
+          decoding="async"
+          className="absolute inset-0 z-10 size-full object-contain"
+        />
+      )}
+    </div>
+  )
+}
+
+function MediaPreviewSlide({ node, fullSrc }: { node: NodeDto; fullSrc?: string }) {
   const isVideo = node.mime_type?.startsWith("video/")
   return (
     <div className="relative size-full overflow-hidden bg-background">
-      {node.preview_url ? (
-        <>
-          <img
-            src={node.preview_url}
-            alt=""
-            aria-hidden
-            draggable={false}
-            className="pointer-events-none absolute inset-0 size-full scale-110 object-cover blur-2xl brightness-90"
-          />
-          <img
-            src={node.preview_url}
-            alt=""
-            draggable={false}
-            className="relative z-10 size-full object-contain"
-          />
-        </>
-      ) : (
-        <div className="grid size-full place-items-center text-muted-foreground">
-          {isVideo ? <Video className="size-12" /> : <Image className="size-12" />}
-        </div>
+      <ThumbnailBackdrop thumbnailSrc={node.preview_url} icon={isVideo ? <Video className="size-12" /> : <Image className="size-12" />} />
+      {isVideo && fullSrc && (
+        <video src={fullSrc} preload="auto" muted tabIndex={-1} aria-hidden className="pointer-events-none absolute inset-0 size-full opacity-0" />
       )}
       {isVideo && (
         <div className="absolute inset-0 z-20 grid place-items-center">
@@ -3143,6 +3237,10 @@ type MediaActionHandlers = {
   onClose: () => void
 }
 type FullscreenTargetRef = { current: HTMLElement | null }
+
+function isDialogLayerTarget(target: EventTarget | null) {
+  return target instanceof Element && !!target.closest('[data-slot="dialog-content"], [data-slot="dialog-overlay"]')
+}
 
 function MediaViewer({
   node,
@@ -3449,6 +3547,18 @@ function MediaViewer({
       <DialogContent
         showCloseButton={false}
         animateContent={false}
+        onPointerDownOutside={(event) => {
+          const target = event.detail.originalEvent.target
+          if (isDialogLayerTarget(target)) {
+            event.preventDefault()
+          }
+        }}
+        onInteractOutside={(event) => {
+          const target = event.detail.originalEvent.target
+          if (isDialogLayerTarget(target)) {
+            event.preventDefault()
+          }
+        }}
         className="h-svh max-h-svh w-screen max-w-none gap-0 overflow-hidden rounded-none border-0 bg-background p-0 text-foreground shadow-none ring-0 sm:max-w-none"
       >
         <DialogTitle className="sr-only">{node?.name ?? "Apercu"}</DialogTitle>
@@ -3474,11 +3584,11 @@ function MediaViewer({
                   return (
                     <div key={slotNode.id} className="h-full w-full shrink-0 overflow-hidden">
                       {slotImage ? (
-                        slotNode.id === node.id ? (
-                          <FullImageViewer node={slotNode} src={mediaInlineUrl(slotNode)} />
-                        ) : (
-                          <MediaPreviewSlide node={slotNode} />
-                        )
+                        <CarouselImageSlide
+                          thumbnailSrc={slotNode.preview_url}
+                          fullSrc={mediaInlineUrl(slotNode)}
+                          alt={slotNode.name}
+                        />
                       ) : slotVideo ? (
                         slotNode.id === node.id ? (
                           <ModernVideoPlayer
@@ -3494,7 +3604,7 @@ function MediaViewer({
                             }}
                           />
                         ) : (
-                          <MediaPreviewSlide node={slotNode} />
+                          <MediaPreviewSlide node={slotNode} fullSrc={mediaInlineUrl(slotNode)} />
                         )
                       ) : slotNode.id === node.id ? (
                         <div className="grid size-full place-items-center">
@@ -3507,14 +3617,6 @@ function MediaViewer({
                   )
                 })}
               </div>
-            </div>
-
-            <div className="pointer-events-none invisible absolute size-0 overflow-hidden">
-              {[prev, next]
-                .filter((candidate): candidate is NodeDto => !!candidate)
-                .map((candidate) => (
-                  <MediaPrefetch key={candidate.id} node={candidate} />
-                ))}
             </div>
 
             {prev && (
@@ -3596,64 +3698,6 @@ function MediaViewer({
   )
 }
 
-const FULL_IMAGE_MAX_RETRIES = 3
-
-function FullImageViewer({ node, src }: { node: NodeDto; src: string }) {
-  const [loaded, setLoaded] = useState(false)
-  const [aspectRatio, setAspectRatio] = useState<number | null>(null)
-  const [attempt, setAttempt] = useState(0)
-  const viewport = useViewportSize()
-  const frameStyle = containedMediaFrameStyle(aspectRatio, viewport)
-
-  useEffect(() => {
-    setLoaded(false)
-    setAspectRatio(null)
-    setAttempt(0)
-  }, [src])
-
-  // Sur echec (reseau, requete annulee), on retente quelques fois avec cache-busting
-  // plutot que de laisser une image cassee -> le plein finit par charger.
-  const retrySrc = attempt === 0 ? src : `${src}${src.includes("?") ? "&" : "?"}retry=${attempt}`
-
-  return (
-    <div className="relative grid size-full place-items-center overflow-hidden bg-background">
-      <div
-        className="relative grid place-items-center overflow-hidden"
-        style={frameStyle ?? fallbackMediaFrameStyle()}
-      >
-        <BlurredPreviewLayer
-          node={node}
-          visible={!loaded}
-          onAspectRatio={setAspectRatio}
-        />
-        {!loaded && (
-          <div className="absolute inset-0 z-10 grid place-items-center text-primary">
-            <Loader2 className="size-8 animate-spin" />
-          </div>
-        )}
-        <img
-          src={retrySrc}
-          alt={node.name}
-          draggable={false}
-          className={cn("relative z-20 size-full object-contain", loaded ? "opacity-100" : "opacity-0")}
-          onLoad={(event) => {
-            const ratio = imageAspectRatio(event.currentTarget)
-            if (ratio) setAspectRatio(ratio)
-            setLoaded(true)
-          }}
-          onError={() => {
-            if (attempt < FULL_IMAGE_MAX_RETRIES) {
-              window.setTimeout(() => setAttempt((value) => value + 1), 600)
-            } else {
-              setLoaded(true)
-            }
-          }}
-        />
-      </div>
-    </div>
-  )
-}
-
 function BlurredPreviewLayer({
   node,
   visible,
@@ -3672,12 +3716,21 @@ function BlurredPreviewLayer({
         visible ? "opacity-100" : "opacity-0",
       )}
     >
-      <ProtectedPreview
+      <img
         src={node.preview_url}
-        showFallback={false}
-        className="scale-105 blur-2xl brightness-75 saturate-125"
-        onImageLoad={(image) => {
-          const ratio = imageAspectRatio(image)
+        alt=""
+        aria-hidden
+        draggable={false}
+        className="absolute inset-0 size-full scale-110 object-cover blur-2xl brightness-75 saturate-125"
+      />
+      <img
+        src={node.preview_url}
+        alt=""
+        aria-hidden
+        draggable={false}
+        className="absolute inset-0 size-full object-contain"
+        onLoad={(event) => {
+          const ratio = imageAspectRatio(event.currentTarget)
           if (ratio) onAspectRatio?.(ratio)
         }}
       />
@@ -5085,6 +5138,21 @@ function removeNodesByIds(nodes: NodeDto[], ids: Set<string>) {
 
 function isFileNode(node: NodeDto) {
   return node.kind === "file"
+}
+
+function replacementMediaNodeAfterDelete(mediaNodes: NodeDto[], deletedIds: Set<string>, currentId: string) {
+  const index = mediaNodes.findIndex((node) => node.id === currentId)
+  if (index < 0) return null
+
+  for (let i = index + 1; i < mediaNodes.length; i += 1) {
+    const candidate = mediaNodes[i]
+    if (!deletedIds.has(candidate.id)) return candidate
+  }
+  for (let i = index - 1; i >= 0; i -= 1) {
+    const candidate = mediaNodes[i]
+    if (!deletedIds.has(candidate.id)) return candidate
+  }
+  return null
 }
 
 function reconcileNodeChildren(nodes: NodeDto[], node: NodeDto, parentId: string, sortMode: SortMode) {
